@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Python 3.14+, managed with `uv`
 - Virtual environment: `.venv/` (already created)
 - Install dependencies: `uv sync`
-- Dependencies: `requests`, `dlt[duckdb]`
+- Dependencies: `requests`, `dlt[duckdb]`, `tqdm`
 
 ## Running
 
@@ -32,6 +32,14 @@ Three standalone modules (no package structure):
 - **`musicbrainz_stream.py`** — `MusicBrainzDumpStream` class that streams a `.tar.xz` archive over HTTP, decompresses on the fly via `tarfile`, and yields parsed JSON objects from JSONL files under `mbdump/`. Designed as an iterable to plug directly into a dlt `@dlt.resource` generator.
 
 - **`pipeline.py`** — dlt pipeline script. Defines a `@dlt.source` named `musicbrainz` with three `@dlt.resource` functions (`artist`, `release_group`, `event`), each streaming its corresponding dump archive. Loads into a local DuckDB database with `write_disposition="replace"`.
+
+## Performance Configuration
+
+`.dlt/config.toml` tunes the pipeline for a 5GB RAM environment:
+- Extract and normalize file rotation at 50k items / 1MB per file
+- 2 parallel normalize workers (multiprocessing)
+
+dlt picks up this config automatically — no code changes needed.
 
 ## Data Source
 

@@ -34,6 +34,7 @@ if __name__ == "__main__":
         pipeline_name="musicbrainz",
         destination="duckdb",
         dataset_name="musicbrainz",
+        progress="tqdm",
     )
 
     info = pipeline.run(musicbrainz(base_url))

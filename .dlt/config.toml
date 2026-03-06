@@ -1,0 +1,10 @@
+[extract.data_writer]
+file_max_items = 50000
+file_max_bytes = 1000000
+
+[normalize]
+workers = 2
+
+[normalize.data_writer]
+file_max_items = 50000
+file_max_bytes = 1000000

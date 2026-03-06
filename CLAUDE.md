@@ -1,46 +1,97 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## Project Overview
 
-**is-rock-alive** is a Python project that ingests MusicBrainz JSON dump data. It downloads, stream-decompresses, and parses MusicBrainz `.tar.xz` dump archives into JSON records, intended for use as a dlt (data load tool) resource.
+**is-rock-alive** is a data engineering portfolio project that answers "Is rock alive?" by analyzing MusicBrainz data — tracking rock releases over time, active artists, and events.
+
+## Stack
+
+- **Ingestion**: dlt (data load tool) writing Parquet files
+- **Storage**: MinIO (local folders during development)
+- **Processing**: DuckDB + dbt (medallion lakehouse: bronze → silver → gold)
+- **Dashboards**: Apache Superset
+- **Orchestration**: Apache Airflow (manual triggers only)
+- **Infrastructure**: Docker Compose
+- **Language**: Python 3.14+, managed with uv
 
 ## Setup
 
-- Python 3.14+, managed with `uv`
-- Virtual environment: `.venv/` (already created)
-- Install dependencies: `uv sync`
-- Dependencies: `requests`, `dlt[duckdb]`, `tqdm`
+```bash
+uv sync                    # install dependencies
+uv sync --extra dev        # install with test dependencies
+```
 
-## Running
+## Running the Ingestion Pipeline
 
 ```bash
-# Discover latest dump URL
-uv run python latest_dump.py
+# Step 1: Download archives to data/landing/
+uv run python -m is_rock_alive.ingestion.download
 
-# Run the full dlt pipeline (loads artist, release_group, event into DuckDB)
-uv run python pipeline.py
+# Step 2: Load into Parquet files in data/bronze/
+uv run python -m is_rock_alive.ingestion.pipeline
+
+# Step 3: Clean up landing archives (only deletes if bronze data exists)
+uv run python -m is_rock_alive.ingestion.cleanup
+```
+
+## Running Tests
+
+```bash
+uv run pytest                         # unit tests only
+uv run pytest -m integration          # integration tests (requires network)
+uv run pytest -m "not integration"    # skip integration tests
+```
+
+## Project Structure
+
+```
+is-rock-alive/
+├── src/is_rock_alive/          # Main Python package
+│   └── ingestion/              # Ingestion layer (dlt pipeline)
+│       ├── latest_dump.py      # Resolve latest MusicBrainz dump URL
+│       ├── download.py         # Download tar.xz archives to landing
+│       ├── stream.py           # Stream-decompress archives, yield JSON
+│       ├── pipeline.py         # dlt source/pipeline definition
+│       └── cleanup.py          # Delete landing files after bronze load
+├── tests/ingestion/            # Tests for ingestion modules
+├── dags/                       # Airflow DAGs (future)
+├── dbt/                        # dbt project (future)
+├── docker/                     # Dockerfiles (future)
+├── data/
+│   ├── landing/                # Downloaded tar.xz archives
+│   ├── bronze/                 # Raw Parquet from dlt (full replace)
+│   ├── silver/                 # Cleaned/transformed (future, dbt)
+│   └── gold/                   # Modeled/aggregated (future, dbt)
+├── .dlt/config.toml            # dlt config (tuned for 5GB RAM)
+├── docker-compose.yml          # Docker Compose (future)
+└── pyproject.toml
 ```
 
 ## Architecture
 
-Three standalone modules (no package structure):
+### Medallion Lakehouse
 
-- **`latest_dump.py`** — `LatestDump` class that scrapes the MusicBrainz dump index page to resolve the URL of the latest `json-dumps` directory. Parses the `latest-is-<date>` link from the HTML.
+- **Landing**: Raw tar.xz archives downloaded from MusicBrainz
+- **Bronze**: Raw Parquet files produced by dlt (full replace each run)
+- **Silver**: Cleaned and typed data (future — dbt + DuckDB)
+- **Gold**: Aggregated analytics tables (future — dbt + DuckDB)
 
-- **`musicbrainz_stream.py`** — `MusicBrainzDumpStream` class that streams a `.tar.xz` archive over HTTP, decompresses on the fly via `tarfile`, and yields parsed JSON objects from JSONL files under `mbdump/`. Designed as an iterable to plug directly into a dlt `@dlt.resource` generator.
+### Ingestion Design
 
-- **`pipeline.py`** — dlt pipeline script. Defines a `@dlt.source` named `musicbrainz` with three `@dlt.resource` functions (`artist`, `release_group`, `event`), each streaming its corresponding dump archive. Loads into a local DuckDB database with `write_disposition="replace"`.
+Each module exposes a callable function (not just a script), making them composable as Airflow tasks. The `__main__` blocks allow manual execution.
 
-## Performance Configuration
+MusicBrainz entities ingested: `artist`, `release_group`, `event`.
 
-`.dlt/config.toml` tunes the pipeline for a 5GB RAM environment:
-- Extract and normalize file rotation at 50k items / 1MB per file
-- 2 parallel normalize workers (multiprocessing)
+Data source: `https://data.metabrainz.org/pub/musicbrainz/data/json-dumps/`
 
-dlt picks up this config automatically — no code changes needed.
+### Performance
 
-## Data Source
+`.dlt/config.toml` tunes the pipeline for 5GB RAM:
+- Extract/normalize file rotation: 50k items / 1MB per file
+- 2 parallel normalize workers
 
-MusicBrainz JSON dumps are hosted at `https://data.metabrainz.org/pub/musicbrainz/data/json-dumps/`. Archives contain JSONL files under a `mbdump/` prefix inside the tar.
+## Conventions
+
+- All functions accept paths as parameters (no hardcoded globals) for testability
+- Integration tests (HTTP calls) are marked with `pytest.mark.integration`
+- Data directories are gitignored; structure preserved via `.gitkeep` files

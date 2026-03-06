@@ -12,5 +12,12 @@ wheels/
 # Claude files
 .claude
 
-# Data
+# Data files
+data/landing/
+data/bronze/
+data/silver/
+data/gold/
 *.duckdb
+
+# dlt internal state
+*.dlt/pipeline/

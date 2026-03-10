@@ -11,6 +11,9 @@ dbt/dbt_packages/
 dbt/logs/
 dbt/profiles.yml
 
+# dlt
+.dlt/secrets.toml
+
 # Python
 __pycache__/
 *.pyc

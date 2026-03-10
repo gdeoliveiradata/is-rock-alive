@@ -9,10 +9,12 @@ MusicBrainz data engineering project on GCP. Ingests music metadata (artists, re
 ## Architecture
 
 ```
-MusicBrainz Dump (tar.xz/JSONL) --> GCS Raw Bucket --> BigQuery (raw)
-MusicBrainz API (daily incremental) --> GCS Raw Bucket --> BigQuery (raw)
+MusicBrainz Dump (tar.xz/JSONL) --> [dlt on Cloud Run Job] --> GCS Raw Bucket --> BigQuery (raw)
+MusicBrainz API (daily incremental) --> [dlt on Cloud Run Job] --> GCS Raw Bucket --> BigQuery (raw)
 BigQuery (raw) --> dbt staging --> dbt curated --> dbt analytics --> Looker Studio
-Orchestration: Airflow on GCE VM (e2-small)
+Orchestration: Airflow on GCE VM (e2-small, scheduling only)
+Ingestion compute: Cloud Run Jobs (up to 32 GB RAM, pay-per-use)
+Container images: Artifact Registry
 Infrastructure: Terraform
 CI/CD: GitHub Actions
 ```
@@ -89,7 +91,8 @@ pytest tests/
 ## Key Design Decisions
 
 - **No JSON key files**: SA key creation is disabled by org policy (`constraints/iam.disableServiceAccountKeyCreation`). Locally, Terraform and other tools authenticate via Application Default Credentials (`gcloud auth application-default login`). In CI/CD, GitHub Actions uses Workload Identity Federation to impersonate the Terraform SA with short-lived tokens.
-- **Local Airflow for dev, GCE VM for prod**: Docker Compose for development; GCE e2-small VM (~$15-30/mo) for production scheduling
+- **Local Airflow for dev, GCE VM for prod**: Docker Compose for development; GCE e2-small VM for production scheduling (scheduling only — no heavy compute). VM kept stopped when idle to save costs (~$1-2/mo disk-only vs. ~$15-30/mo always-on); started manually (`gcloud compute instances start`) or via GCE instance schedule for pipeline windows
+- **Ephemeral compute for ingestion**: dlt ingestion runs on Cloud Run Jobs (up to 32 GB RAM, pay-per-use). Airflow triggers Cloud Run jobs via `CloudRunExecuteJobOperator`. Container images stored in Artifact Registry
 - **Append-only raw layer**: raw tables use WRITE_APPEND, deduplication on MBIDs happens in dbt staging
 - **Watermark-based incrementals**: track last sync timestamp per entity, API pulls only new/updated records
 - **Genre via tags**: MusicBrainz has no genre field — genres come from the tag system. A `genre_mapping` dbt seed maps raw tags (e.g., "hard rock", "classic rock") to standardized categories

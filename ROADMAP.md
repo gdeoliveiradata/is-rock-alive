@@ -54,9 +54,13 @@ End-to-end data engineering project on GCP: ingest MusicBrainz data (initial bul
     cloudresourcemanager.googleapis.com \
     cloudbuild.googleapis.com \
     secretmanager.googleapis.com \
-    serviceusage.googleapis.com
+    serviceusage.googleapis.com \
+    run.googleapis.com \
+    artifactregistry.googleapis.com
   ```
 
+> **Note**: `run.googleapis.com` and `artifactregistry.googleapis.com` were added after Phase 0 was completed (Cloud Run architecture decision). Enable these two APIs before starting Phase 1.
+>
 > **Study**: [GCP API enablement](https://cloud.google.com/apis/docs/getting-started#enabling_apis) — what each API controls and why you need it.
 
 ### 0.5 Create Service Accounts ✅
@@ -64,11 +68,14 @@ End-to-end data engineering project on GCP: ingest MusicBrainz data (initial bul
 **Why service accounts?** In GCP, workloads (scripts, Terraform, Airflow) authenticate as *service accounts*, not as your personal user. This lets you grant fine-grained permissions and follows the principle of least privilege — each component only gets the access it needs, limiting blast radius if credentials are compromised.
 
 - [x] Create a Terraform service account with `roles/editor` + `roles/iam.securityAdmin`
-- [x] Create a pipeline service account (used by Airflow/dbt) with least-privilege roles:
+- [x] Create a pipeline service account (used by Airflow/dbt/Cloud Run) with least-privilege roles:
   - `roles/bigquery.dataEditor` — read/write BigQuery tables
   - `roles/bigquery.jobUser` — run BigQuery queries
   - `roles/storage.objectAdmin` — read/write GCS objects
   - `roles/compute.instanceAdmin.v1` — manage the Airflow GCE VM
+  - `roles/run.invoker` — trigger Cloud Run jobs (used by Airflow) *(added post Phase 0 — grant before Phase 1)*
+  - `roles/run.developer` — deploy/update Cloud Run job definitions *(added post Phase 0 — grant before Phase 1)*
+  - `roles/artifactregistry.writer` — push dlt container images *(added post Phase 0 — grant before Phase 1)*
 - [x] ~~Download JSON key for Terraform SA~~ — **Skipped.** No JSON keys needed. Locally, Terraform authenticates via Application Default Credentials (`gcloud auth application-default login`). In CI/CD (Phase 7), GitHub Actions will use Workload Identity Federation to impersonate the Terraform SA with short-lived tokens — more secure than long-lived key files. The org policy `constraints/iam.disableServiceAccountKeyCreation` also blocks key creation, which aligns with this approach.
 - [ ] ~~Configure Workload Identity Federation for GitHub Actions~~ — **Deferred to Phase 7.** WIF is only needed when GitHub Actions workflows exist. The Terraform SA will be impersonated via WIF at that point.
 
@@ -96,7 +103,9 @@ terraform/
   terraform.tfvars     # Variable values (gitignored)
   gcs.tf               # GCS buckets
   bigquery.tf          # BigQuery datasets
-  airflow_vm.tf        # GCE VM for Airflow (e2-small)
+  artifact_registry.tf # Docker repo for dlt container images
+  cloud_run.tf         # Cloud Run job for dlt ingestion
+  airflow_vm.tf        # GCE VM for Airflow (e2-small, scheduling only)
   iam.tf               # Service accounts and IAM bindings
   outputs.tf           # Output values (bucket names, dataset IDs)
 ```
@@ -129,7 +138,32 @@ terraform/
 >
 > **Study**: [Object lifecycle management](https://cloud.google.com/storage/docs/lifecycle)
 
-### 1.4 Provision BigQuery Datasets
+### 1.4 Provision Artifact Registry
+
+**Why Artifact Registry?** Your dlt ingestion script runs as a Cloud Run job, which requires a container image. Artifact Registry is GCP's managed Docker registry — it stores your container images close to where they run, with IAM-based access control (no separate Docker Hub credentials needed).
+
+- [ ] Create a Docker repository in Artifact Registry (e.g., `dlt-pipelines`)
+- [ ] Region: `us-central1` (same as your other resources)
+
+> **Study**: [Artifact Registry overview](https://cloud.google.com/artifact-registry/docs/overview) — how it differs from the older Container Registry, and how to push/pull images.
+
+### 1.5 Provision Cloud Run Job
+
+**Why Cloud Run Jobs?** Your dlt ingestion script is memory-heavy — too much for the e2-small Airflow VM. Cloud Run Jobs let you run batch workloads with up to 32 GB of RAM, and you only pay for the execution time. Airflow stays lightweight (just the scheduler), and Cloud Run handles the heavy lifting.
+
+- [ ] Define a Cloud Run job resource for dlt ingestion (e.g., `musicbrainz-ingest`)
+  - Memory: up to 32 GB (tune based on actual dlt needs)
+  - CPU: 4-8 vCPUs
+  - Timeout: up to 24 hours (adjust based on ingestion duration)
+  - Execution SA: pipeline service account
+  - Image: from Artifact Registry (`us-central1-docker.pkg.dev/<PROJECT_ID>/dlt-pipelines/musicbrainz-ingest`)
+- [ ] Configure secrets via environment variables or Secret Manager (not baked into the image)
+
+> **Note**: The Cloud Run job definition can be created in Terraform now, but the actual container image won't exist until Phase 2 when you build the dlt ingestion script and its Dockerfile.
+>
+> **Study**: [Cloud Run Jobs overview](https://cloud.google.com/run/docs/create-jobs) — how jobs differ from services, execution environment, and configuration options.
+
+### 1.6 Provision BigQuery Datasets
 
 **Why BigQuery?** It's a serverless, columnar data warehouse that scales to petabytes with zero infrastructure management. You pay per query (first 1 TB/mo free) and per storage (first 10 GB/mo free). For analytics workloads, it's the natural choice on GCP.
 
@@ -147,21 +181,21 @@ terraform/
 >
 > **Study**: [Medallion architecture](https://www.databricks.com/glossary/medallion-architecture) — the bronze/silver/gold (raw/curated/analytics) pattern we're using. Originally from Databricks but widely adopted.
 
-### 1.5 Local Airflow with Docker (Development)
+### 1.7 Local Airflow with Docker (Development)
 
 **Why start local?** For development and learning, a local Airflow instance in Docker is free and gives you the same DAG authoring experience. Once your DAGs are stable, you'll deploy to a GCE e2-small VM (~$15-30/mo) for production scheduling.
 
 - [ ] Create `docker-compose.yml` for local Airflow (use the [official Airflow Docker Compose](https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html))
 - [ ] Mount local `dags/` and `scripts/` directories into the container
-- [ ] Configure Airflow to use your GCP service account key for BigQuery/GCS access
+- [ ] Configure Airflow to use your GCP service account for BigQuery/GCS access
 - [ ] Verify the Airflow UI is accessible at `localhost:8080`
 
 > **Study**: [Running Airflow in Docker](https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html) — official guide for the Docker Compose setup.
 >
 > **Study**: [Airflow concepts](https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/index.html) — DAGs, tasks, operators, sensors, XComs. Understand these before writing your first DAG.
 
-### 1.6 Provision IAM & Networking
-- [ ] Bind pipeline SA roles to BigQuery datasets and GCS buckets
+### 1.8 Provision IAM & Networking
+- [ ] Bind pipeline SA roles to BigQuery datasets, GCS buckets, Artifact Registry, and Cloud Run
 - [ ] Apply: `terraform init && terraform plan && terraform apply`
 
 > **Study**: [Terraform plan/apply workflow](https://developer.hashicorp.com/terraform/cli/run) — always `plan` before `apply` to see what will change. Treat `plan` output like a code diff.
@@ -423,7 +457,7 @@ dags/
 
 ### 5.5 Deploy Airflow on GCE VM (Production)
 
-**Why a GCE VM?** Cloud Composer wraps Airflow on GKE and costs ~$300-400/mo minimum — overkill for this project. A single e2-small VM running Airflow with Docker Compose costs ~$15-30/mo and gives you full control. You manage the VM yourself, but for a learning project this is a feature, not a bug — you'll understand how Airflow actually runs.
+**Why a GCE VM?** Cloud Composer wraps Airflow on GKE and costs ~$300-400/mo minimum — overkill for this project. A single e2-small VM running Airflow with Docker Compose costs ~$15-30/mo if always on. However, for a portfolio project you don't need it running 24/7 — keeping the VM stopped when idle and only starting it for development or pipeline runs brings the cost down to ~$1-2/mo (disk-only charges). This gives you the same real Airflow deployment to showcase, without the always-on bill.
 
 - [ ] Add `airflow_vm.tf` to Terraform:
   - e2-small instance in `us-central1`
@@ -435,8 +469,13 @@ dags/
 - [ ] Configure Airflow connections to use the VM's attached service account for GCP auth
 - [ ] Verify the Airflow UI is accessible at `http://<VM_EXTERNAL_IP>:8080`
 - [ ] Set up a basic monitoring alert (VM uptime check) in GCP
+- [ ] Configure VM cost optimization (pick one or both):
+  - **Manual start/stop**: use `gcloud compute instances start/stop` when developing or demoing
+  - **GCE instance schedule**: auto-start/stop the VM during specific hours (e.g., 6-8 AM UTC for daily pipeline runs) — reduces cost from ~$15-30/mo to ~$1-2/mo
 
 > **Study**: [GCE instance creation with Terraform](https://registry.terraform.io/providers/hashicorp/google/latest/docs/resources/compute_instance) — Terraform resource for managing GCE VMs.
+>
+> **Study**: [GCE instance schedules](https://cloud.google.com/compute/docs/instances/schedule-instance-start-stop) — how to auto-start/stop VMs on a schedule to save costs.
 >
 > **Security note**: Restrict Airflow UI access via firewall rules (allow only your IP). For extra security, use IAP (Identity-Aware Proxy) to tunnel SSH and web access without exposing ports publicly.
 
@@ -596,6 +635,7 @@ Before diving into implementation, consider studying these topics in order. You 
 
 - **Region**: `us-central1` — cheapest for most GCP services, free BigQuery data transfer within US multi-region.
 - **Local Airflow for dev, GCE VM for prod**: Develop and test DAGs locally with Docker Compose. Deploy to a GCE e2-small VM (~$15-30/mo) for production scheduling — much cheaper than Cloud Composer (~$300-400/mo).
+- **Ephemeral compute for ingestion**: dlt ingestion runs on Cloud Run Jobs (up to 32 GB RAM, pay-per-use), not on the Airflow VM. Airflow only orchestrates — it triggers Cloud Run jobs and monitors their status. This keeps the Airflow VM small (e2-small) while allowing memory-heavy ingestion workloads. Container images are stored in Artifact Registry.
 - **MusicBrainz API rate limit**: 1 req/sec. For large incremental catches, consider using the database dumps instead of the API.
 - **Genre identification**: MusicBrainz uses a tag system, not a strict genre hierarchy. You'll need a `genre_mapping` seed to categorize tags like "hard rock", "punk rock", "progressive rock" under "Rock".
 - **Incremental strategy**: Use `_load_timestamp` watermarks + dbt incremental models with deduplication on MusicBrainz entity IDs (MBIDs).

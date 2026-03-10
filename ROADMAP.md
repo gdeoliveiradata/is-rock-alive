@@ -4,46 +4,46 @@ End-to-end data engineering project on GCP: ingest MusicBrainz data (initial bul
 
 ---
 
-## Phase 0: GCP Account & Project Setup
+## Phase 0: GCP Account & Project Setup ✅
 
 **Why this phase matters**: Every GCP resource lives inside a *project*, which is the unit of billing, permissions, and API access. Getting this right upfront avoids headaches later — a misconfigured project or missing API enablement will block every subsequent phase.
 
 > **Study**: [GCP Resource Hierarchy](https://cloud.google.com/resource-manager/docs/cloud-platform-resource-hierarchy) — understand how organizations, folders, and projects relate. For a personal project you only need a project, but knowing the hierarchy helps you understand IAM inheritance.
 
-### 0.1 Create GCP Account
-- [ ] Create a Google account (or use existing)
-- [ ] Go to https://cloud.google.com and sign up for GCP
-- [ ] Activate the $300 free trial credit (valid 90 days)
-- [ ] Add a billing account with a payment method
+### 0.1 Create GCP Account ✅
+- [x] Create a Google account (or use existing)
+- [x] Go to https://cloud.google.com and sign up for GCP
+- [x] Activate the $300 free trial credit (valid 90 days)
+- [x] Add a billing account with a payment method
 
 > **Study**: [GCP Free Tier overview](https://cloud.google.com/free/docs/free-cloud-features) — know what's always free (BigQuery 1 TB/mo queries, 10 GB/mo storage) vs. trial credits.
 
-### 0.2 Create GCP Project
-- [ ] Create a new GCP project (e.g., `musicbrainz-lakehouse`)
-- [ ] Note the **Project ID** (globally unique, cannot be changed later)
-- [ ] Link the project to your billing account
-- [ ] Set budget alerts at $25 and $50 to avoid surprises
+### 0.2 Create GCP Project ✅
+- [x] Create a new GCP project (e.g., `musicbrainz-lakehouse`)
+- [x] Note the **Project ID** (globally unique, cannot be changed later)
+- [x] Link the project to your billing account
+- [x] Set budget alerts at $25 and $50 to avoid surprises
 
 > **Why budget alerts?** Cloud costs can spike unexpectedly — a runaway query or forgotten VM can burn through credits fast. Alerts are your safety net.
 >
 > **Study**: [Creating and managing budgets](https://cloud.google.com/billing/docs/how-to/budgets)
 
-### 0.3 Install Local Tooling
-- [ ] Install the [Google Cloud SDK (gcloud CLI)](https://cloud.google.com/sdk/docs/install)
-- [ ] Run `gcloud init` and authenticate with your account
-- [ ] Set default project: `gcloud config set project <PROJECT_ID>`
-- [ ] Install Terraform (v1.5+): https://developer.hashicorp.com/terraform/install
-- [ ] Install dbt-core + dbt-bigquery: `pip install dbt-core dbt-bigquery`
-- [ ] Install Python 3.10+ (for Airflow DAGs and ingestion scripts)
-- [ ] Create a GitHub repository for this project
+### 0.3 Install Local Tooling ✅
+- [x] Install the [Google Cloud SDK (gcloud CLI)](https://cloud.google.com/sdk/docs/install)
+- [x] Run `gcloud init` and authenticate with your account
+- [x] Set default project: `gcloud config set project <PROJECT_ID>`
+- [x] Install Terraform (v1.5+): https://developer.hashicorp.com/terraform/install
+- [x] Install dbt-core + dbt-bigquery: `pip install dbt-core dbt-bigquery`
+- [x] Install Python 3.10+ (for Airflow DAGs and ingestion scripts)
+- [x] Create a GitHub repository for this project
 
 > **Why gcloud CLI?** It's your Swiss Army knife for GCP — authentication, API enablement, debugging, and quick ad-hoc commands. Terraform handles infrastructure, but gcloud fills in the gaps.
 
-### 0.4 Enable Required GCP APIs
+### 0.4 Enable Required GCP APIs ✅
 
 **Why enable APIs?** GCP follows a "disabled by default" model. Each service (BigQuery, GCS, IAM, etc.) has an API that must be explicitly turned on before you can use it. This is a security feature — you only expose the surface area you need.
 
-- [ ] Enable APIs via gcloud (or Terraform later):
+- [x] Enable APIs via gcloud (or Terraform later):
   ```bash
   gcloud services enable \
     bigquery.googleapis.com \
@@ -59,22 +59,24 @@ End-to-end data engineering project on GCP: ingest MusicBrainz data (initial bul
 
 > **Study**: [GCP API enablement](https://cloud.google.com/apis/docs/getting-started#enabling_apis) — what each API controls and why you need it.
 
-### 0.5 Create Service Accounts
+### 0.5 Create Service Accounts ✅
 
 **Why service accounts?** In GCP, workloads (scripts, Terraform, Airflow) authenticate as *service accounts*, not as your personal user. This lets you grant fine-grained permissions and follows the principle of least privilege — each component only gets the access it needs, limiting blast radius if credentials are compromised.
 
-- [ ] Create a Terraform service account with `roles/editor` + `roles/iam.securityAdmin`
-- [ ] Create a pipeline service account (used by Airflow/dbt) with least-privilege roles:
+- [x] Create a Terraform service account with `roles/editor` + `roles/iam.securityAdmin`
+- [x] Create a pipeline service account (used by Airflow/dbt) with least-privilege roles:
   - `roles/bigquery.dataEditor` — read/write BigQuery tables
   - `roles/bigquery.jobUser` — run BigQuery queries
   - `roles/storage.objectAdmin` — read/write GCS objects
   - `roles/compute.instanceAdmin.v1` — manage the Airflow GCE VM
-- [ ] Download JSON key for Terraform SA (store securely, never commit to git)
-- [ ] Configure Workload Identity Federation for GitHub Actions (keyless auth)
+- [x] ~~Download JSON key for Terraform SA~~ — **Skipped.** No JSON keys needed. Locally, Terraform authenticates via Application Default Credentials (`gcloud auth application-default login`). In CI/CD (Phase 7), GitHub Actions will use Workload Identity Federation to impersonate the Terraform SA with short-lived tokens — more secure than long-lived key files. The org policy `constraints/iam.disableServiceAccountKeyCreation` also blocks key creation, which aligns with this approach.
+- [ ] ~~Configure Workload Identity Federation for GitHub Actions~~ — **Deferred to Phase 7.** WIF is only needed when GitHub Actions workflows exist. The Terraform SA will be impersonated via WIF at that point.
 
 > **Study**: [IAM overview](https://cloud.google.com/iam/docs/overview) — understand principals, roles, and policies. Then read [Service accounts](https://cloud.google.com/iam/docs/service-account-overview) to understand why workloads use SAs instead of user accounts.
 >
 > **Study**: [Workload Identity Federation](https://cloud.google.com/iam/docs/workload-identity-federation) — how GitHub Actions authenticates to GCP without storing long-lived keys. This is the modern best practice over JSON key files.
+>
+> **Study**: [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials) — how tools like Terraform discover credentials automatically without key files.
 
 ---
 
@@ -500,7 +502,7 @@ README.md
 
 - [ ] On PR: `terraform fmt -check`, `terraform validate`, `terraform plan`
 - [ ] On merge to main: `terraform apply -auto-approve`
-- [ ] Use Workload Identity Federation for keyless GCP auth from GitHub Actions
+- [ ] Configure Workload Identity Federation for keyless GCP auth from GitHub Actions (deferred from Phase 0.5 — set up the trust relationship between GCP and GitHub, so workflows can impersonate the Terraform SA)
 - [ ] Store project config in GitHub Secrets / Variables
 
 ### 7.3 dbt CI/CD

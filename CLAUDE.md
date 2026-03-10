@@ -88,6 +88,7 @@ pytest tests/
 
 ## Key Design Decisions
 
+- **No JSON key files**: SA key creation is disabled by org policy (`constraints/iam.disableServiceAccountKeyCreation`). Locally, Terraform and other tools authenticate via Application Default Credentials (`gcloud auth application-default login`). In CI/CD, GitHub Actions uses Workload Identity Federation to impersonate the Terraform SA with short-lived tokens.
 - **Local Airflow for dev, GCE VM for prod**: Docker Compose for development; GCE e2-small VM (~$15-30/mo) for production scheduling
 - **Append-only raw layer**: raw tables use WRITE_APPEND, deduplication on MBIDs happens in dbt staging
 - **Watermark-based incrementals**: track last sync timestamp per entity, API pulls only new/updated records
@@ -97,5 +98,5 @@ pytest tests/
 ## User Context
 
 - This is a learning project — the user is a GCP/data engineering beginner
-- Prefer clear explanations over terse commands
 - See `ROADMAP.md` for the full phased implementation plan with study references
+- **Teaching approach**: Explain concepts, provide references/docs, and describe *how* to do things — but do NOT give ready-made answers (commands, code, configs) upfront. The user wants to learn by figuring it out themselves, not by copying output. Only give direct answers when explicitly asked for them.

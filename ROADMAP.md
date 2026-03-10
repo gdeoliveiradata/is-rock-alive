@@ -112,14 +112,20 @@ terraform/
 
 > **Why split into multiple files?** Terraform merges all `.tf` files in a directory. Splitting by resource type makes it easier to navigate and review changes. This is a common convention, not a requirement.
 
-### 1.2 Configure Terraform Backend
+### 1.2 Configure Terraform Backend ✅
 
 **Why a remote backend?** Terraform tracks what it has created in a *state file*. By default this is local (`terraform.tfstate`), but storing it in GCS means it's shared, versioned, and not lost if your machine dies. It also enables state locking to prevent concurrent modifications.
 
-- [ ] Create a GCS bucket manually for Terraform state: `gs://<PROJECT_ID>-tf-state`
-- [ ] Configure remote backend in `main.tf`
-- [ ] Configure the `google` provider with project, region (`us-central1` recommended for cost)
+- [x] Create a GCS bucket manually for Terraform state: `gs://is-rock-alive-tf-state`
+- [x] Configure remote backend in `main.tf`
+- [x] Configure the `google` provider with project, region, zone using input variables
+- [x] Create `variables.tf` (declarations) and `terraform.tfvars` (values, gitignored)
+- [x] Run `terraform init` successfully
 
+> **Lesson learned**: The `backend` block does not support variables, `local`, or any expressions — only literal values. This is because Terraform evaluates the backend *before* processing the rest of the configuration. The bucket name must be hardcoded in `main.tf`.
+>
+> **Lesson learned**: Don't create the state bucket with Hierarchical Namespace (HNS) enabled — HNS buckets don't support object versioning, which is recommended for state recovery.
+>
 > **Study**: [GCS backend configuration](https://developer.hashicorp.com/terraform/language/backend/gcs)
 
 ### 1.3 Provision GCS Buckets (Data Lake)

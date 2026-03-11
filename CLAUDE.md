@@ -96,6 +96,8 @@ pytest tests/
 - **Append-only raw layer**: raw tables use WRITE_APPEND, deduplication on MBIDs happens in dbt staging
 - **Watermark-based incrementals**: track last sync timestamp per entity, API pulls only new/updated records
 - **Genre via tags**: MusicBrainz has no genre field — genres come from the tag system. A `genre_mapping` dbt seed maps raw tags (e.g., "hard rock", "classic rock") to standardized categories
+- **JSONL for raw layer**: Raw GCS files stay in JSONL (source format). Schema-on-read avoids Parquet schema merge issues across files, and BigQuery loads JSONL natively for free. Parquet is better suited for curated/analytics layers.
+- **dlt normalization TBD**: Decide at Phase 2 implementation time whether to disable dlt normalization (let dbt own all transformations) or use it selectively. Avoid splitting transformation logic across dlt and dbt unnecessarily.
 - **Region**: `us-central1` for cost; BigQuery dataset in `US` multi-region for free GCS transfer
 
 ## User Context

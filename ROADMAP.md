@@ -94,6 +94,8 @@ End-to-end data engineering project on GCP: ingest MusicBrainz data (initial bul
 > **Study**: [Terraform fundamentals](https://developer.hashicorp.com/terraform/tutorials/gcp-get-started) — HashiCorp's official GCP getting-started tutorial. Covers providers, resources, state, plan, and apply.
 >
 > **Study**: [Terraform state](https://developer.hashicorp.com/terraform/language/state) — why state exists, why it must be stored remotely for team work, and what happens if it gets out of sync.
+>
+> **Study**: [Terraform resources](https://developer.hashicorp.com/terraform/language/resources) — syntax and behavior of resource blocks, including lifecycle, meta-arguments, and dependencies.
 
 ### 1.1 Terraform Project Structure
 ```
@@ -143,6 +145,8 @@ terraform/
 > **Study**: [GCS storage classes](https://cloud.google.com/storage/docs/storage-classes) — Standard vs. Nearline vs. Coldline vs. Archive and when to use each.
 >
 > **Study**: [Object lifecycle management](https://cloud.google.com/storage/docs/lifecycle)
+>
+> **Study**: [Terraform for Cloud Storage](https://docs.cloud.google.com/storage/docs/terraform-for-cloud-storage) — how to create and manage GCS buckets with Terraform, including examples for lifecycle rules, versioning, and access control.
 
 ### 1.4 Provision Artifact Registry
 
@@ -215,6 +219,14 @@ terraform/
 > **Study**: [MusicBrainz database documentation](https://musicbrainz.org/doc/MusicBrainz_Database) — understand what's in the dump, how often it's published, and the data model.
 >
 > **Study**: [MusicBrainz schema diagram](https://musicbrainz.org/doc/MusicBrainz_Database/Schema) — the entity relationships. This is critical for understanding how artists, releases, labels, and tags connect.
+
+### Design Decisions to Resolve Before Building the Pipeline
+
+> **JSONL vs. Parquet for the raw layer**: JSONL is the preferred format for the raw GCS landing zone. Reasons: (1) it matches the source format (MusicBrainz dumps are JSONL), keeping raw faithful to the source; (2) schema-on-read — JSONL tolerates inconsistent/optional fields across records without schema merge issues that Parquet would introduce across multiple files; (3) BigQuery load jobs ingest JSONL natively and for free; (4) raw data is rarely re-read (it's an archive/reprocessing safety net), so Parquet's I/O and compression advantages matter less here. Parquet is better suited for curated/analytics layers where the schema is stable and data is read repeatedly.
+>
+> **dlt normalization vs. dbt transformation**: dlt's default normalization (flattening nested JSON, renaming columns, creating child tables) overlaps with what dbt staging models do (clean, cast, rename). Decide at implementation time whether to: (a) disable dlt normalization and keep raw data as-is, letting dbt own all transformation logic in one place; or (b) use dlt normalization selectively if it simplifies the dbt layer. Key consideration: splitting transformation logic across two tools (dlt + dbt) makes debugging and maintenance harder. Evaluate the tradeoffs when building the actual pipeline.
+>
+> **Study**: [dlt normalization docs](https://dlthub.com/docs/general-usage/schema#data-normalizer) — how to configure or disable normalization behavior.
 
 ### 2.1 Download MusicBrainz Data Dump
 - [ ] Download the latest MusicBrainz JSON dump from https://musicbrainz.org/doc/MusicBrainz_Database

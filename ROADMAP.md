@@ -1,6 +1,8 @@
 # MusicBrainz Data Engineering Project - Roadmap
 
-End-to-end data engineering project on GCP: ingest MusicBrainz data (initial bulk load from JSONL dumps + incremental API loads), build a lakehouse on GCS + BigQuery, transform with dbt, orchestrate with Airflow (local Docker for dev, GCE e2-small VM for production), visualize with Looker Studio. Focus: tracking rock artists, albums, labels, events, and genres over the years.
+End-to-end data engineering project on GCP: ingest MusicBrainz data (initial bulk load from JSONL dumps + daily incremental via API), build a lakehouse on GCS + BigQuery, transform with dbt, orchestrate with Airflow (local Docker for dev, GCE e2-small VM for production), visualize with Looker Studio. Focus: tracking rock artists, albums, labels, events, and genres over the years.
+
+**Ingestion strategy**: Both ingestion pipelines run as Cloud Run Jobs (containerized, pay-per-use). The initial bulk load uses simple Python scripts (`google-cloud-storage` + `google-cloud-bigquery`) — no dlt, since it's a one-time operation. The daily incremental API loads use dlt, where its strengths (pagination, rate limiting, watermark tracking, schema evolution) add real value. Both pipelines share the same Artifact Registry repository for container images.
 
 ---
 
@@ -105,8 +107,8 @@ terraform/
   terraform.tfvars     # Variable values (gitignored)
   gcs.tf               # GCS buckets
   bigquery.tf          # BigQuery datasets
-  artifact_registry.tf # Docker repo for dlt container images
-  cloud_run.tf         # Cloud Run job for dlt ingestion
+  artifact_registry.tf # Docker repo for pipeline container images
+  cloud_run.tf         # Cloud Run jobs (bulk load + incremental ingestion)
   airflow_vm.tf        # GCE VM for Airflow (e2-small, scheduling only)
   iam.tf               # Service accounts and IAM bindings
   outputs.tf           # Output values (bucket names, dataset IDs)
@@ -130,15 +132,16 @@ terraform/
 >
 > **Study**: [GCS backend configuration](https://developer.hashicorp.com/terraform/language/backend/gcs)
 
-### 1.3 Provision GCS Buckets (Data Lake)
+### 1.3 Provision GCS Buckets (Data Lake) ✅
 
 **Why GCS as the raw layer?** Cloud object storage (GCS) is the standard landing zone for data lakes: it's cheap ($0.02/GB/mo for Standard), infinitely scalable, supports any file format, and integrates natively with BigQuery for loading. Raw data lives here so you always have an immutable copy of what was ingested — if your transformations have bugs, you can reprocess from raw.
 
-- [ ] **Raw layer bucket**: `gs://<PROJECT_ID>-raw` — landing zone for JSONL dumps and API responses
+- [x] **Raw layer bucket**: `gs://<PROJECT_ID>-raw` — landing zone for JSONL dumps and API responses
   - Subdirectories: `musicbrainz-dump/`, `api-incremental/`
   - Lifecycle rule: transition to Nearline after 90 days
-- [ ] **Staging bucket**: `gs://<PROJECT_ID>-staging` — temporary processing area
-- [ ] **Airflow VM bucket** (optional): `gs://<PROJECT_ID>-airflow` — for syncing DAGs and scripts to the GCE VM
+- [x] **Staging bucket**: `gs://<PROJECT_ID>-staging` — temporary processing area
+- [x] **Airflow VM bucket** (optional): `gs://<PROJECT_ID>-airflow` — for syncing DAGs and scripts to the GCE VM
+- [x] All buckets use `uniform_bucket_level_access = true` (IAM-only, no legacy ACLs)
 
 > **Why lifecycle rules?** Old raw data is rarely re-read. Moving it automatically to cheaper storage classes (Nearline: $0.01/GB/mo) saves money without deleting anything.
 >
@@ -147,29 +150,38 @@ terraform/
 > **Study**: [Object lifecycle management](https://cloud.google.com/storage/docs/lifecycle)
 >
 > **Study**: [Terraform for Cloud Storage](https://docs.cloud.google.com/storage/docs/terraform-for-cloud-storage) — how to create and manage GCS buckets with Terraform, including examples for lifecycle rules, versioning, and access control.
+>
+> **Lesson learned**: Enable `uniform_bucket_level_access` on all buckets — it simplifies permissions by using IAM only (no legacy per-object ACLs), which aligns with the SA-based auth strategy. GCP recommends this for new buckets.
 
 ### 1.4 Provision Artifact Registry
 
-**Why Artifact Registry?** Your dlt ingestion script runs as a Cloud Run job, which requires a container image. Artifact Registry is GCP's managed Docker registry — it stores your container images close to where they run, with IAM-based access control (no separate Docker Hub credentials needed).
+**Why Artifact Registry?** Both ingestion pipelines (bulk load and incremental) run as Cloud Run Jobs, which require container images. Artifact Registry is GCP's managed Docker registry — it stores your container images close to where they run, with IAM-based access control (no separate Docker Hub credentials needed).
 
-- [ ] Create a Docker repository in Artifact Registry (e.g., `dlt-pipelines`)
+- [ ] Create a Docker repository in Artifact Registry (e.g., `pipelines`)
 - [ ] Region: `us-central1` (same as your other resources)
 
 > **Study**: [Artifact Registry overview](https://cloud.google.com/artifact-registry/docs/overview) — how it differs from the older Container Registry, and how to push/pull images.
 
-### 1.5 Provision Cloud Run Job
+### 1.5 Provision Cloud Run Jobs
 
-**Why Cloud Run Jobs?** Your dlt ingestion script is memory-heavy — too much for the e2-small Airflow VM. Cloud Run Jobs let you run batch workloads with up to 32 GB of RAM, and you only pay for the execution time. Airflow stays lightweight (just the scheduler), and Cloud Run handles the heavy lifting.
+**Why Cloud Run Jobs?** Ingestion workloads need more memory than the e2-small Airflow VM provides. Cloud Run Jobs let you run batch workloads with up to 32 GB of RAM, and you only pay for the execution time. Airflow stays lightweight (just the scheduler), and Cloud Run handles the heavy lifting. Running the bulk load on Cloud Run also gives you faster network (same region as GCS) and avoids consuming local resources.
 
-- [ ] Define a Cloud Run job resource for dlt ingestion (e.g., `musicbrainz-ingest`)
+- [ ] Define a Cloud Run job for the initial bulk load (e.g., `musicbrainz-bulk-load`)
+  - Handles: downloading tar.xz dumps, stream-extracting, uploading JSONL chunks to GCS, loading into BigQuery
+  - Memory/CPU: tune based on stream extraction needs
+  - Timeout: up to 24 hours (adjust based on total ingestion duration)
+  - Execution SA: pipeline service account
+  - Image: from Artifact Registry (`us-central1-docker.pkg.dev/<PROJECT_ID>/pipelines/musicbrainz-bulk-load`)
+- [ ] Define a Cloud Run job for dlt incremental ingestion (e.g., `musicbrainz-incremental`)
+  - Handles: API pagination, rate limiting, watermark tracking, GCS upload, BigQuery load
   - Memory: up to 32 GB (tune based on actual dlt needs)
   - CPU: 4-8 vCPUs
-  - Timeout: up to 24 hours (adjust based on ingestion duration)
+  - Timeout: up to 24 hours
   - Execution SA: pipeline service account
-  - Image: from Artifact Registry (`us-central1-docker.pkg.dev/<PROJECT_ID>/dlt-pipelines/musicbrainz-ingest`)
-- [ ] Configure secrets via environment variables or Secret Manager (not baked into the image)
+  - Image: from Artifact Registry (`us-central1-docker.pkg.dev/<PROJECT_ID>/pipelines/musicbrainz-incremental`)
+- [ ] Configure secrets via environment variables or Secret Manager (not baked into images)
 
-> **Note**: The Cloud Run job definition can be created in Terraform now, but the actual container image won't exist until Phase 2 when you build the dlt ingestion script and its Dockerfile.
+> **Note**: The Cloud Run job definitions can be created in Terraform now, but the actual container images won't exist until Phase 2 (bulk load) and Phase 3 (incremental) when you build the scripts and their Dockerfiles.
 >
 > **Study**: [Cloud Run Jobs overview](https://cloud.google.com/run/docs/create-jobs) — how jobs differ from services, execution environment, and configuration options.
 
@@ -220,61 +232,74 @@ terraform/
 >
 > **Study**: [MusicBrainz schema diagram](https://musicbrainz.org/doc/MusicBrainz_Database/Schema) — the entity relationships. This is critical for understanding how artists, releases, labels, and tags connect.
 
-### Design Decisions to Resolve Before Building the Pipeline
+### Design Decisions (Resolved)
 
 > **JSONL vs. Parquet for the raw layer**: JSONL is the preferred format for the raw GCS landing zone. Reasons: (1) it matches the source format (MusicBrainz dumps are JSONL), keeping raw faithful to the source; (2) schema-on-read — JSONL tolerates inconsistent/optional fields across records without schema merge issues that Parquet would introduce across multiple files; (3) BigQuery load jobs ingest JSONL natively and for free; (4) raw data is rarely re-read (it's an archive/reprocessing safety net), so Parquet's I/O and compression advantages matter less here. Parquet is better suited for curated/analytics layers where the schema is stable and data is read repeatedly.
 >
-> **dlt normalization vs. dbt transformation**: dlt's default normalization (flattening nested JSON, renaming columns, creating child tables) overlaps with what dbt staging models do (clean, cast, rename). Decide at implementation time whether to: (a) disable dlt normalization and keep raw data as-is, letting dbt own all transformation logic in one place; or (b) use dlt normalization selectively if it simplifies the dbt layer. Key consideration: splitting transformation logic across two tools (dlt + dbt) makes debugging and maintenance harder. Evaluate the tradeoffs when building the actual pipeline.
+> **No dlt for the bulk load**: The initial dump load is a one-time operation — using dlt would be over-engineering. Simple Python scripts with `google-cloud-storage` and `google-cloud-bigquery` give you direct experience with core GCP client libraries, full control over stream extraction and chunking, and a cleaner separation of tools (bulk load = Python scripts, incremental = dlt, transformation = dbt). The script runs as a Cloud Run Job (containerized, same region as GCS for fast network, no local resource constraints). dlt's strengths (pagination, rate limiting, watermarks, schema evolution) are a natural fit for the incremental API pipeline in Phase 3.
+>
+> **dlt normalization (for Phase 3 incremental)**: Disable dlt normalization and keep raw data as-is. dbt owns all transformation logic in one place (staging layer). Splitting transformation across dlt + dbt makes debugging and maintenance harder.
 >
 > **Study**: [dlt normalization docs](https://dlthub.com/docs/general-usage/schema#data-normalizer) — how to configure or disable normalization behavior.
 
-### 2.1 Download MusicBrainz Data Dump
-- [ ] Download the latest MusicBrainz JSON dump from https://musicbrainz.org/doc/MusicBrainz_Database
-- [ ] The dump comes as `tar.xz` files containing JSONL
-- [ ] Extract locally and inspect the schema for target entities:
-  - `artist` — name, type, area, begin/end dates, disambiguation
-  - `release_group` — title, type (album/single/EP), artist credit, first release date
-  - `label` — name, type, area, begin/end dates
-  - `event` — name, type, begin/end dates, place
-  - `genre` — name (linked via tags on artists/release_groups)
-  - `artist_tag` / `release_group_tag` — genre/tag associations with counts
+### 2.1 Explore MusicBrainz Data Dump
+- [ ] Explore the dump index at https://data.metabrainz.org/pub/musicbrainz/data/json-dumps/
+  - `artist.tar.xz` (~2 GB compressed) — name, type, area, begin/end dates, disambiguation, relations, genres, tags
+  - `release-group.tar.xz` (~1 GB compressed) — title, type (album/single/EP), artist credit, first release date
+  - `label.tar.xz` (~161 MB compressed) — name, type, area, begin/end dates
+  - `event.tar.xz` (~42 MB compressed) — name, type, begin/end dates, place
+- [ ] Download a small sample locally (e.g., `event.tar.xz` at 42 MB) to inspect the structure
+- [ ] The dumps are `tar.xz` files containing a single JSONL file inside `mbdump/<entity>`
+- [ ] Inspect a few lines to understand the nested structure (each record contains embedded objects for relations, genres, tags, aliases, area, life-span, etc.)
+- [ ] Note: genres/tags are embedded inside artist and release-group records — there's no separate genre dump. The dbt staging layer will extract these into dedicated models.
 
 > **Why JSONL?** JSON Lines (one JSON object per line) is ideal for big data pipelines: it's streamable (no need to parse the whole file), splittable (each line is independent), and directly supported by BigQuery load jobs.
-
-### 2.2 Upload Raw Data to GCS
-- [ ] Write a Python script (`scripts/upload_dump.py`) to:
-  - Stream-extract the tar.xz (avoid decompressing fully to disk)
-  - Upload JSONL files to `gs://<PROJECT_ID>-raw/musicbrainz-dump/<entity>/`
-  - Partition large files into manageable chunks (100MB each)
-- [ ] Use `google-cloud-storage` Python library or `gsutil -m cp`
-
-> **Why stream-extract?** A 5 GB tar.xz might decompress to 30+ GB. Streaming avoids needing that disk space — you read compressed data and upload directly.
 >
-> **Why chunk large files?** BigQuery load jobs and GCS uploads perform better with files in the 100MB-1GB range. Too many tiny files = overhead; one huge file = no parallelism.
+> **Data sizes**: The target entities total ~3.4 GB compressed. The deeply nested JSON (especially artist relations) will expand significantly when decompressed — the script handles this via stream extraction, avoiding full decompression to disk.
 >
-> **Study**: [gsutil cp](https://cloud.google.com/storage/docs/gsutil/commands/cp) — the `-m` flag enables parallel uploads.
+> **Note**: You don't need to download the full dumps to your machine — the Cloud Run Job will download them directly from MusicBrainz. Local exploration is just for understanding the data structure.
+
+### 2.2 Write the Bulk Load Script
+- [ ] Write a Python script (`scripts/bulk_load.py`) that handles the full pipeline:
+  1. **Download**: Stream the tar.xz directly from MusicBrainz (no need to save the full archive)
+  2. **Extract**: Stream-extract the JSONL using Python's `tarfile` module (avoid decompressing fully to disk)
+  3. **Upload**: Upload JSONL chunks (~100 MB each) to `gs://<PROJECT_ID>-raw/musicbrainz-dump/<entity>/`
+  4. **Load**: Create BigQuery load jobs from the GCS chunks into `raw.<entity>` tables
+  5. **Validate**: Compare row counts against MusicBrainz published statistics
+- [ ] Use `google-cloud-storage` and `google-cloud-bigquery` Python client libraries
+- [ ] Log progress (entity, chunk count, bytes uploaded, rows loaded, elapsed time)
+- [ ] Write disposition: WRITE_TRUNCATE (full replace for initial load)
+- [ ] Target entities: artist, release-group, label, event
+
+> **Why one script?** The download → extract → upload → load steps are sequential per entity and run together as a single Cloud Run Job execution. Keeping them in one script simplifies the container and avoids intermediate state management.
 >
-> **Study**: [google-cloud-storage Python client](https://cloud.google.com/storage/docs/reference/libraries#client-libraries-install-python)
-
-### 2.3 Load into BigQuery Raw Layer
-
-**Why BigQuery load jobs instead of INSERT statements?** Load jobs are BigQuery's bulk ingestion mechanism — they're free (no query cost), handle schema detection, and can ingest gigabytes in minutes. INSERT statements charge per query and are meant for small volumes.
-
-- [ ] Create BigQuery load jobs for each entity:
-  - Source: `gs://<PROJECT_ID>-raw/musicbrainz-dump/<entity>/*.jsonl`
-  - Destination: `raw.<entity>`
-  - Format: JSONL with autodetect schema (review and fix as needed)
-  - Write disposition: WRITE_TRUNCATE (full replace for initial load)
-- [ ] Write as a Python script (`scripts/initial_load.py`) using `google-cloud-bigquery`
-- [ ] Validate row counts against MusicBrainz published statistics
-
+> **Why stream-extract?** The artist dump alone is ~2 GB compressed and could expand to 15-20 GB of deeply nested JSON. Streaming through Python's `tarfile` module avoids needing that disk space — you read the compressed archive and upload chunks directly to GCS.
+>
+> **Why chunk large files?** BigQuery load jobs perform better with files in the 100 MB–1 GB range. Too many tiny files = overhead; one huge file = no parallelism. Chunking also gives you natural restart points if an upload fails.
+>
 > **Why WRITE_TRUNCATE?** For the initial load, you want a clean slate. TRUNCATE replaces the entire table. For incrementals later, you'll use WRITE_APPEND.
 >
 > **Why validate row counts?** Data ingestion can silently drop rows (malformed JSON, encoding issues). Comparing your counts to MusicBrainz's published stats catches these problems early.
 >
+> **Study**: [Python tarfile module](https://docs.python.org/3/library/tarfile.html) — how to read tar archives in streaming mode.
+>
+> **Study**: [google-cloud-storage Python client](https://cloud.google.com/storage/docs/reference/libraries#client-libraries-install-python) — specifically `Blob.upload_from_file()` for streaming uploads.
+>
 > **Study**: [Loading JSON data into BigQuery](https://cloud.google.com/bigquery/docs/loading-data-cloud-storage-json)
 >
 > **Study**: [BigQuery Python client](https://cloud.google.com/bigquery/docs/reference/libraries#client-libraries-install-python) — specifically `LoadJobConfig` and `load_table_from_uri`.
+
+### 2.3 Containerize and Deploy
+- [ ] Write a `Dockerfile` for the bulk load script (Python base image + `google-cloud-storage` and `google-cloud-bigquery` dependencies)
+- [ ] Build and push the image to Artifact Registry
+- [ ] Execute the Cloud Run Job (`musicbrainz-bulk-load`) — trigger manually via `gcloud run jobs execute` or the console
+- [ ] Monitor execution in the Cloud Run logs
+
+> **Why containerize?** Cloud Run Jobs require container images. The Dockerfile is simple — a Python base image, install dependencies, copy the script. This is also good practice for the incremental pipeline in Phase 3, which follows the same pattern.
+>
+> **Study**: [Building container images for Cloud Run](https://cloud.google.com/run/docs/building/containers) — best practices for Dockerfiles targeting Cloud Run.
+>
+> **Study**: [Pushing images to Artifact Registry](https://cloud.google.com/artifact-registry/docs/docker/pushing-and-pulling) — how to tag, push, and manage container images.
 
 ---
 
@@ -653,7 +678,7 @@ Before diving into implementation, consider studying these topics in order. You 
 
 - **Region**: `us-central1` — cheapest for most GCP services, free BigQuery data transfer within US multi-region.
 - **Local Airflow for dev, GCE VM for prod**: Develop and test DAGs locally with Docker Compose. Deploy to a GCE e2-small VM (~$15-30/mo) for production scheduling — much cheaper than Cloud Composer (~$300-400/mo).
-- **Ephemeral compute for ingestion**: dlt ingestion runs on Cloud Run Jobs (up to 32 GB RAM, pay-per-use), not on the Airflow VM. Airflow only orchestrates — it triggers Cloud Run jobs and monitors their status. This keeps the Airflow VM small (e2-small) while allowing memory-heavy ingestion workloads. Container images are stored in Artifact Registry.
+- **Two ingestion approaches, both on Cloud Run**: The initial bulk load uses simple Python scripts (`google-cloud-storage` + `google-cloud-bigquery`) — no dlt, since it's a one-time operation. The daily incremental API loads use dlt — its pagination, rate limiting, and watermark tracking add real value for recurring pipelines. Both run as Cloud Run Jobs (up to 32 GB RAM, pay-per-use) for fast network, no local resource constraints, and consistent deployment. Airflow only orchestrates — it triggers Cloud Run jobs and monitors their status. Container images are stored in Artifact Registry.
 - **MusicBrainz API rate limit**: 1 req/sec. For large incremental catches, consider using the database dumps instead of the API.
 - **Genre identification**: MusicBrainz uses a tag system, not a strict genre hierarchy. You'll need a `genre_mapping` seed to categorize tags like "hard rock", "punk rock", "progressive rock" under "Rock".
 - **Incremental strategy**: Use `_load_timestamp` watermarks + dbt incremental models with deduplication on MusicBrainz entity IDs (MBIDs).

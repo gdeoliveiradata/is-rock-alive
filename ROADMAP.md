@@ -2,7 +2,7 @@
 
 End-to-end data engineering project on GCP: ingest MusicBrainz data (initial bulk load from JSONL dumps + daily incremental via API), build a lakehouse on GCS + BigQuery, transform with dbt, orchestrate with Airflow (local Docker for dev, GCE e2-small VM for production), visualize with Looker Studio. Focus: tracking rock artists, albums, labels, events, and genres over the years.
 
-**Ingestion strategy**: Both ingestion pipelines run as Cloud Run Jobs (containerized, pay-per-use). The initial bulk load uses simple Python scripts (`google-cloud-storage` + `google-cloud-bigquery`) — no dlt, since it's a one-time operation. The daily incremental API loads use dlt, where its strengths (pagination, rate limiting, watermark tracking, schema evolution) add real value. Both pipelines share the same Artifact Registry repository for container images.
+**Ingestion strategy**: Both ingestion pipelines run as Cloud Run Jobs (pay-per-use), deployed via source-based deployment (`gcloud run deploy --source`). Cloud Run automatically builds container images using Google Cloud Buildpacks and stores them in an auto-managed Artifact Registry repository — no manual Dockerfile, image build, or registry management needed. The initial bulk load uses simple Python scripts (`google-cloud-storage` + `google-cloud-bigquery`) — no dlt, since it's a one-time operation. The daily incremental API loads use dlt, where its strengths (pagination, rate limiting, watermark tracking, schema evolution) add real value.
 
 ---
 
@@ -57,11 +57,10 @@ End-to-end data engineering project on GCP: ingest MusicBrainz data (initial bul
     cloudbuild.googleapis.com \
     secretmanager.googleapis.com \
     serviceusage.googleapis.com \
-    run.googleapis.com \
-    artifactregistry.googleapis.com
+    run.googleapis.com
   ```
 
-> **Note**: `run.googleapis.com` and `artifactregistry.googleapis.com` were added after Phase 0 was completed (Cloud Run architecture decision). Enable these two APIs before starting Phase 1.
+> **Note**: `run.googleapis.com` was added after Phase 0 was completed (Cloud Run architecture decision). `cloudbuild.googleapis.com` is also required — Cloud Run's source-based deployment uses Cloud Build to build container images automatically. Enable both before starting Phase 1.
 >
 > **Study**: [GCP API enablement](https://cloud.google.com/apis/docs/getting-started#enabling_apis) — what each API controls and why you need it.
 
@@ -77,7 +76,6 @@ End-to-end data engineering project on GCP: ingest MusicBrainz data (initial bul
   - `roles/compute.instanceAdmin.v1` — manage the Airflow GCE VM
   - `roles/run.invoker` — trigger Cloud Run jobs (used by Airflow) *(added post Phase 0 — grant before Phase 1)*
   - `roles/run.developer` — deploy/update Cloud Run job definitions *(added post Phase 0 — grant before Phase 1)*
-  - `roles/artifactregistry.writer` — push dlt container images *(added post Phase 0 — grant before Phase 1)*
 - [x] ~~Download JSON key for Terraform SA~~ — **Skipped.** No JSON keys needed. Locally, Terraform authenticates via Application Default Credentials (`gcloud auth application-default login`). In CI/CD (Phase 7), GitHub Actions will use Workload Identity Federation to impersonate the Terraform SA with short-lived tokens — more secure than long-lived key files. The org policy `constraints/iam.disableServiceAccountKeyCreation` also blocks key creation, which aligns with this approach.
 - [ ] ~~Configure Workload Identity Federation for GitHub Actions~~ — **Deferred to Phase 7.** WIF is only needed when GitHub Actions workflows exist. The Terraform SA will be impersonated via WIF at that point.
 
@@ -107,7 +105,6 @@ terraform/
   terraform.tfvars     # Variable values (gitignored)
   gcs.tf               # GCS buckets
   bigquery.tf          # BigQuery datasets
-  artifact_registry.tf # Docker repo for pipeline container images
   cloud_run.tf         # Cloud Run jobs (bulk load + incremental ingestion)
   airflow_vm.tf        # GCE VM for Airflow (e2-small, scheduling only)
   iam.tf               # Service accounts and IAM bindings
@@ -153,39 +150,32 @@ terraform/
 >
 > **Lesson learned**: Enable `uniform_bucket_level_access` on all buckets — it simplifies permissions by using IAM only (no legacy per-object ACLs), which aligns with the SA-based auth strategy. GCP recommends this for new buckets.
 
-### 1.4 Provision Artifact Registry
-
-**Why Artifact Registry?** Both ingestion pipelines (bulk load and incremental) run as Cloud Run Jobs, which require container images. Artifact Registry is GCP's managed Docker registry — it stores your container images close to where they run, with IAM-based access control (no separate Docker Hub credentials needed).
-
-- [ ] Create a Docker repository in Artifact Registry (e.g., `pipelines`)
-- [ ] Region: `us-central1` (same as your other resources)
-
-> **Study**: [Artifact Registry overview](https://cloud.google.com/artifact-registry/docs/overview) — how it differs from the older Container Registry, and how to push/pull images.
-
-### 1.5 Provision Cloud Run Jobs
+### 1.4 Provision Cloud Run Jobs
 
 **Why Cloud Run Jobs?** Ingestion workloads need more memory than the e2-small Airflow VM provides. Cloud Run Jobs let you run batch workloads with up to 32 GB of RAM, and you only pay for the execution time. Airflow stays lightweight (just the scheduler), and Cloud Run handles the heavy lifting. Running the bulk load on Cloud Run also gives you faster network (same region as GCS) and avoids consuming local resources.
 
-- [ ] Define a Cloud Run job for the initial bulk load (e.g., `musicbrainz-bulk-load`)
+**Why source-based deployment?** Cloud Run supports deploying directly from source code (`gcloud run deploy --source`). Cloud Run uses Cloud Build and Google Cloud Buildpacks to automatically build a container image from your Python source, stores it in an auto-managed Artifact Registry repository (`cloud-run-source-deploy`), and deploys it — no Dockerfile, manual image build, or registry management needed. This simplifies the deployment workflow significantly for straightforward Python scripts.
+
+- [ ] Cloud Run job for the initial bulk load (e.g., `musicbrainz-bulk-load`) — deployed from source in Phase 2
   - Handles: downloading tar.xz dumps, stream-extracting, uploading JSONL chunks to GCS, loading into BigQuery
   - Memory/CPU: tune based on stream extraction needs
   - Timeout: up to 24 hours (adjust based on total ingestion duration)
   - Execution SA: pipeline service account
-  - Image: from Artifact Registry (`us-central1-docker.pkg.dev/<PROJECT_ID>/pipelines/musicbrainz-bulk-load`)
-- [ ] Define a Cloud Run job for dlt incremental ingestion (e.g., `musicbrainz-incremental`)
+- [ ] Cloud Run job for dlt incremental ingestion (e.g., `musicbrainz-incremental`) — deployed from source in Phase 3
   - Handles: API pagination, rate limiting, watermark tracking, GCS upload, BigQuery load
   - Memory: up to 32 GB (tune based on actual dlt needs)
   - CPU: 4-8 vCPUs
   - Timeout: up to 24 hours
   - Execution SA: pipeline service account
-  - Image: from Artifact Registry (`us-central1-docker.pkg.dev/<PROJECT_ID>/pipelines/musicbrainz-incremental`)
 - [ ] Configure secrets via environment variables or Secret Manager (not baked into images)
 
-> **Note**: The Cloud Run job definitions can be created in Terraform now, but the actual container images won't exist until Phase 2 (bulk load) and Phase 3 (incremental) when you build the scripts and their Dockerfiles.
+> **Note**: With source-based deployment, the Cloud Run jobs are created at deploy time (`gcloud run deploy --source`) rather than pre-defined in Terraform. Terraform can still manage Cloud Run job configuration (memory, CPU, timeout, SA) after initial deployment, but the initial creation happens via `gcloud` when the source code is ready in Phase 2 and Phase 3.
+>
+> **Study**: [Cloud Run source-based deployment](https://cloud.google.com/run/docs/deploying-source-code) — how `gcloud run deploy --source` works, prerequisites, and buildpack configuration.
 >
 > **Study**: [Cloud Run Jobs overview](https://cloud.google.com/run/docs/create-jobs) — how jobs differ from services, execution environment, and configuration options.
 
-### 1.6 Provision BigQuery Datasets
+### 1.5 Provision BigQuery Datasets
 
 **Why BigQuery?** It's a serverless, columnar data warehouse that scales to petabytes with zero infrastructure management. You pay per query (first 1 TB/mo free) and per storage (first 10 GB/mo free). For analytics workloads, it's the natural choice on GCP.
 
@@ -203,7 +193,7 @@ terraform/
 >
 > **Study**: [Medallion architecture](https://www.databricks.com/glossary/medallion-architecture) — the bronze/silver/gold (raw/curated/analytics) pattern we're using. Originally from Databricks but widely adopted.
 
-### 1.7 Local Airflow with Docker (Development)
+### 1.6 Local Airflow with Docker (Development)
 
 **Why start local?** For development and learning, a local Airflow instance in Docker is free and gives you the same DAG authoring experience. Once your DAGs are stable, you'll deploy to a GCE e2-small VM (~$15-30/mo) for production scheduling.
 
@@ -216,8 +206,8 @@ terraform/
 >
 > **Study**: [Airflow concepts](https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/index.html) — DAGs, tasks, operators, sensors, XComs. Understand these before writing your first DAG.
 
-### 1.8 Provision IAM & Networking
-- [ ] Bind pipeline SA roles to BigQuery datasets, GCS buckets, Artifact Registry, and Cloud Run
+### 1.7 Provision IAM & Networking
+- [ ] Bind pipeline SA roles to BigQuery datasets, GCS buckets, and Cloud Run
 - [ ] Apply: `terraform init && terraform plan && terraform apply`
 
 > **Study**: [Terraform plan/apply workflow](https://developer.hashicorp.com/terraform/cli/run) — always `plan` before `apply` to see what will change. Treat `plan` output like a code diff.
@@ -236,7 +226,7 @@ terraform/
 
 > **JSONL vs. Parquet for the raw layer**: JSONL is the preferred format for the raw GCS landing zone. Reasons: (1) it matches the source format (MusicBrainz dumps are JSONL), keeping raw faithful to the source; (2) schema-on-read — JSONL tolerates inconsistent/optional fields across records without schema merge issues that Parquet would introduce across multiple files; (3) BigQuery load jobs ingest JSONL natively and for free; (4) raw data is rarely re-read (it's an archive/reprocessing safety net), so Parquet's I/O and compression advantages matter less here. Parquet is better suited for curated/analytics layers where the schema is stable and data is read repeatedly.
 >
-> **No dlt for the bulk load**: The initial dump load is a one-time operation — using dlt would be over-engineering. Simple Python scripts with `google-cloud-storage` and `google-cloud-bigquery` give you direct experience with core GCP client libraries, full control over stream extraction and chunking, and a cleaner separation of tools (bulk load = Python scripts, incremental = dlt, transformation = dbt). The script runs as a Cloud Run Job (containerized, same region as GCS for fast network, no local resource constraints). dlt's strengths (pagination, rate limiting, watermarks, schema evolution) are a natural fit for the incremental API pipeline in Phase 3.
+> **No dlt for the bulk load**: The initial dump load is a one-time operation — using dlt would be over-engineering. Simple Python scripts with `google-cloud-storage` and `google-cloud-bigquery` give you direct experience with core GCP client libraries, full control over stream extraction and chunking, and a cleaner separation of tools (bulk load = Python scripts, incremental = dlt, transformation = dbt). The script runs as a Cloud Run Job (deployed from source, same region as GCS for fast network, no local resource constraints). dlt's strengths (pagination, rate limiting, watermarks, schema evolution) are a natural fit for the incremental API pipeline in Phase 3.
 >
 > **dlt normalization (for Phase 3 incremental)**: Disable dlt normalization and keep raw data as-is. dbt owns all transformation logic in one place (staging layer). Splitting transformation across dlt + dbt makes debugging and maintenance harder.
 >
@@ -289,17 +279,19 @@ terraform/
 >
 > **Study**: [BigQuery Python client](https://cloud.google.com/bigquery/docs/reference/libraries#client-libraries-install-python) — specifically `LoadJobConfig` and `load_table_from_uri`.
 
-### 2.3 Containerize and Deploy
-- [ ] Write a `Dockerfile` for the bulk load script (Python base image + `google-cloud-storage` and `google-cloud-bigquery` dependencies)
-- [ ] Build and push the image to Artifact Registry
+### 2.3 Deploy and Execute
+- [ ] Deploy the bulk load script to Cloud Run using source-based deployment (`gcloud run deploy --source`)
+  - Cloud Build + Buildpacks will automatically build the container image from your Python source
+  - Ensure `requirements.txt` lists dependencies (`google-cloud-storage`, `google-cloud-bigquery`)
+  - Configure memory, CPU, timeout, and service account for the job
 - [ ] Execute the Cloud Run Job (`musicbrainz-bulk-load`) — trigger manually via `gcloud run jobs execute` or the console
 - [ ] Monitor execution in the Cloud Run logs
 
-> **Why containerize?** Cloud Run Jobs require container images. The Dockerfile is simple — a Python base image, install dependencies, copy the script. This is also good practice for the incremental pipeline in Phase 3, which follows the same pattern.
+> **Why source-based deployment?** Instead of writing a Dockerfile, building an image, and pushing it to a registry manually, `gcloud run deploy --source` handles all of that automatically. Cloud Run uses Google Cloud Buildpacks to detect your Python project (via `requirements.txt`), build a production-ready container image, store it in an auto-managed Artifact Registry repository, and deploy it. This is the simplest path for standard Python scripts.
 >
-> **Study**: [Building container images for Cloud Run](https://cloud.google.com/run/docs/building/containers) — best practices for Dockerfiles targeting Cloud Run.
+> **Study**: [Cloud Run source-based deployment](https://cloud.google.com/run/docs/deploying-source-code) — how to deploy from source, buildpack detection, and configuration options.
 >
-> **Study**: [Pushing images to Artifact Registry](https://cloud.google.com/artifact-registry/docs/docker/pushing-and-pulling) — how to tag, push, and manage container images.
+> **Study**: [Google Cloud Buildpacks](https://cloud.google.com/docs/buildpacks/overview) — how buildpacks auto-detect your language and build optimized container images.
 
 ---
 
@@ -678,7 +670,7 @@ Before diving into implementation, consider studying these topics in order. You 
 
 - **Region**: `us-central1` — cheapest for most GCP services, free BigQuery data transfer within US multi-region.
 - **Local Airflow for dev, GCE VM for prod**: Develop and test DAGs locally with Docker Compose. Deploy to a GCE e2-small VM (~$15-30/mo) for production scheduling — much cheaper than Cloud Composer (~$300-400/mo).
-- **Two ingestion approaches, both on Cloud Run**: The initial bulk load uses simple Python scripts (`google-cloud-storage` + `google-cloud-bigquery`) — no dlt, since it's a one-time operation. The daily incremental API loads use dlt — its pagination, rate limiting, and watermark tracking add real value for recurring pipelines. Both run as Cloud Run Jobs (up to 32 GB RAM, pay-per-use) for fast network, no local resource constraints, and consistent deployment. Airflow only orchestrates — it triggers Cloud Run jobs and monitors their status. Container images are stored in Artifact Registry.
+- **Two ingestion approaches, both on Cloud Run**: The initial bulk load uses simple Python scripts (`google-cloud-storage` + `google-cloud-bigquery`) — no dlt, since it's a one-time operation. The daily incremental API loads use dlt — its pagination, rate limiting, and watermark tracking add real value for recurring pipelines. Both run as Cloud Run Jobs (up to 32 GB RAM, pay-per-use) for fast network, no local resource constraints, and consistent deployment. Airflow only orchestrates — it triggers Cloud Run jobs and monitors their status. Deployed via source-based deployment (`gcloud run deploy --source`) — no manual Dockerfile, image build, or Artifact Registry management needed.
 - **MusicBrainz API rate limit**: 1 req/sec. For large incremental catches, consider using the database dumps instead of the API.
 - **Genre identification**: MusicBrainz uses a tag system, not a strict genre hierarchy. You'll need a `genre_mapping` seed to categorize tags like "hard rock", "punk rock", "progressive rock" under "Rock".
 - **Incremental strategy**: Use `_load_timestamp` watermarks + dbt incremental models with deduplication on MusicBrainz entity IDs (MBIDs).

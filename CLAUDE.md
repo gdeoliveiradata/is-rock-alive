@@ -70,6 +70,19 @@ ruff check scripts/ dags/       # Python linting
 pytest tests/
 ```
 
+## Key Design Decisions
+
+- **Reproducibility via Terraform**: Phase 0 is a minimal manual bootstrap (GCP account, project, APIs, Terraform SA). Everything else — pipeline SA, IAM bindings, GCS buckets, BigQuery datasets — is provisioned by `terraform apply`. Anyone cloning the repo can reproduce the full infrastructure.
+- **Terraform SA is the only manual step**: The chicken-and-egg problem — Terraform needs a SA to authenticate, so it must be created via `gcloud` before Terraform runs. The pipeline SA and all its role bindings are managed by Terraform.
+- **Additive IAM bindings**: Use `google_project_iam_member` (additive) in Terraform, not `google_project_iam_binding` (authoritative per role) or `google_project_iam_policy` (fully authoritative). This avoids accidentally revoking permissions from the user account or Google-managed SAs.
+- **No JSON key files**: SA key creation is disabled by org policy. Locally, Terraform and tools authenticate via Application Default Credentials (`gcloud auth application-default login`). In CI/CD, GitHub Actions uses Workload Identity Federation.
+- **Cloud Run managed via `gcloud`, not Terraform**: Source-based deployment (`gcloud run jobs deploy --source`) creates the job and builds the container image in one step. Terraform can't do this. `gcloud run jobs deploy` is an upsert (creates or updates).
+- **Two ingestion approaches**: Initial bulk load uses simple Python scripts (`google-cloud-storage` + `google-cloud-bigquery`) — no dlt, since it's a one-time operation. Daily incremental API loads use dlt, with normalization disabled (dbt owns all transformations).
+- **Append-only raw layer**: Raw tables use WRITE_APPEND, deduplication on MBIDs happens in dbt staging.
+- **JSONL for raw layer**: Matches the source format, schema-on-read avoids Parquet merge issues, BigQuery loads JSONL natively for free.
+- **Genre via tags**: MusicBrainz has no genre field — genres come from the tag system. A `genre_mapping` dbt seed maps raw tags to standardized categories.
+- **Region**: `us-central1` for compute; BigQuery dataset in `US` multi-region for free GCS transfer.
+
 ## MusicBrainz API Notes
 
 - Rate limit: 1 request/second — always include a custom User-Agent header
@@ -86,19 +99,6 @@ pytest tests/
    - `curated` (tables) — deduplicate, join, star schema (dims + facts + bridges)
    - `analytics` (tables) — pre-aggregated for dashboards (rock trends by year/subgenre/label)
 4. **Serve**: BigQuery `analytics` -> Looker Studio dashboards
-
-## Key Design Decisions
-
-- **No JSON key files**: SA key creation is disabled by org policy (`constraints/iam.disableServiceAccountKeyCreation`). Locally, Terraform and other tools authenticate via Application Default Credentials (`gcloud auth application-default login`). In CI/CD, GitHub Actions uses Workload Identity Federation to impersonate the Terraform SA with short-lived tokens.
-- **Local Airflow for dev, GCE VM for prod**: Docker Compose for development; GCE e2-small VM for production scheduling (scheduling only — no heavy compute). VM kept stopped when idle to save costs (~$1-2/mo disk-only vs. ~$15-30/mo always-on); started manually (`gcloud compute instances start`) or via GCE instance schedule for pipeline windows
-- **Two ingestion approaches, both on Cloud Run**: Initial bulk load uses simple Python scripts (`google-cloud-storage` + `google-cloud-bigquery`) — no dlt, since it's a one-time operation. Daily incremental API loads use dlt. Both run as Cloud Run Jobs (up to 32 GiB RAM, pay-per-use) for fast network and consistent deployment. Airflow triggers Cloud Run jobs via `CloudRunExecuteJobOperator`. Deployed via source-based deployment (`gcloud run jobs deploy --source`) — Cloud Run builds the container automatically using Google Cloud Buildpacks and stores the image in an auto-managed Artifact Registry repository (`cloud-run-source-deploy`). No manual Dockerfile, image build, or registry management needed.
-- **Cloud Run managed via `gcloud`**: Source-based deployment creates the job and builds the container image in one step. `gcloud run jobs deploy` is an upsert (creates or updates), making it ideal for iterative deployment.
-- **Append-only raw layer**: raw tables use WRITE_APPEND, deduplication on MBIDs happens in dbt staging
-- **Watermark-based incrementals**: track last sync timestamp per entity, API pulls only new/updated records
-- **Genre via tags**: MusicBrainz has no genre field — genres come from the tag system. A `genre_mapping` dbt seed maps raw tags (e.g., "hard rock", "classic rock") to standardized categories
-- **JSONL for raw layer**: Raw GCS files stay in JSONL (source format). Schema-on-read avoids Parquet schema merge issues across files, and BigQuery loads JSONL natively for free. Parquet is better suited for curated/analytics layers.
-- **dlt normalization disabled**: dlt normalization is disabled for the incremental pipeline — raw data lands as-is, and dbt owns all transformation logic in the staging layer. This avoids splitting transformation across two tools.
-- **Region**: `us-central1` for cost; BigQuery dataset in `US` multi-region for free GCS transfer
 
 ## User Context
 

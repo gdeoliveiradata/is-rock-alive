@@ -1,51 +1,44 @@
 # MusicBrainz Data Engineering Project - Roadmap
 
-End-to-end data engineering project on GCP: ingest MusicBrainz data (initial bulk load from JSONL dumps + daily incremental via API), build a lakehouse on GCS + BigQuery, transform with dbt, orchestrate with Airflow (local Docker for dev, GCE e2-small VM for production), visualize with Looker Studio. Focus: tracking rock artists, albums, labels, events, and genres over the years.
+End-to-end data engineering project on GCP: ingest MusicBrainz data (initial bulk load from JSONL dumps + daily incremental via API), build a lakehouse on GCS + BigQuery, transform with dbt, orchestrate with Airflow, visualize with Looker Studio. Focus: tracking rock artists, albums, labels, events, and genres over the years.
 
-**Ingestion strategy**: Both ingestion pipelines run as Cloud Run Jobs (pay-per-use), deployed via source-based deployment (`gcloud run jobs deploy --source`). Cloud Run automatically builds container images using Google Cloud Buildpacks and stores them in an auto-managed Artifact Registry repository — no manual Dockerfile, image build, or registry management needed. Cloud Run Jobs are managed entirely via `gcloud`. The initial bulk load uses simple Python scripts (`google-cloud-storage` + `google-cloud-bigquery`) — no dlt, since it's a one-time operation. The daily incremental API loads use dlt, where its strengths (pagination, rate limiting, watermark tracking, schema evolution) add real value.
+**Design principle — reproducibility**: The entire project should be reproducible by anyone who clones the repo. Phase 0 is a minimal manual bootstrap (GCP account + Terraform SA). From Phase 1 onward, `terraform apply` provisions all infrastructure, service accounts, and IAM bindings. Cloud Run Jobs are the exception — they're managed via `gcloud` because source-based deployment builds and deploys in one step, which Terraform can't do.
 
 ---
 
-## Phase 0: GCP Account & Project Setup ✅
+## Phase 0: Bootstrap
 
-**Why this phase matters**: Every GCP resource lives inside a *project*, which is the unit of billing, permissions, and API access. Getting this right upfront avoids headaches later — a misconfigured project or missing API enablement will block every subsequent phase.
+**Why this phase matters**: Every GCP resource lives inside a *project*, which is the unit of billing, permissions, and API access. This phase is the minimal manual setup that can't be automated — creating the GCP project and the Terraform service account (chicken-and-egg: Terraform can't create the SA it needs to authenticate as).
 
 > **Study**: [GCP Resource Hierarchy](https://cloud.google.com/resource-manager/docs/cloud-platform-resource-hierarchy) — understand how organizations, folders, and projects relate. For a personal project you only need a project, but knowing the hierarchy helps you understand IAM inheritance.
 
-### 0.1 Create GCP Account ✅
-- [x] Create a Google account (or use existing)
-- [x] Go to https://cloud.google.com and sign up for GCP
-- [x] Activate the $300 free trial credit (valid 90 days)
-- [x] Add a billing account with a payment method
-
-> **Study**: [GCP Free Tier overview](https://cloud.google.com/free/docs/free-cloud-features) — know what's always free (BigQuery 1 TB/mo queries, 10 GB/mo storage) vs. trial credits.
-
-### 0.2 Create GCP Project ✅
-- [x] Create a new GCP project (e.g., `musicbrainz-lakehouse`)
-- [x] Note the **Project ID** (globally unique, cannot be changed later)
-- [x] Link the project to your billing account
-- [x] Set budget alerts at $25 and $50 to avoid surprises
+### 0.1 Create GCP Account & Project
+- [ ] Create a Google account (or use existing)
+- [ ] Sign up for GCP at https://cloud.google.com and activate the $300 free trial
+- [ ] Create a new GCP project (e.g., `musicbrainz-lakehouse`)
+- [ ] Link the project to a billing account
+- [ ] Set budget alerts at $25 and $50
 
 > **Why budget alerts?** Cloud costs can spike unexpectedly — a runaway query or forgotten VM can burn through credits fast. Alerts are your safety net.
 >
+> **Study**: [GCP Free Tier overview](https://cloud.google.com/free/docs/free-cloud-features) — know what's always free (BigQuery 1 TB/mo queries, 10 GB/mo storage) vs. trial credits.
+>
 > **Study**: [Creating and managing budgets](https://cloud.google.com/billing/docs/how-to/budgets)
 
-### 0.3 Install Local Tooling ✅
-- [x] Install the [Google Cloud SDK (gcloud CLI)](https://cloud.google.com/sdk/docs/install)
-- [x] Run `gcloud init` and authenticate with your account
-- [x] Set default project: `gcloud config set project <PROJECT_ID>`
-- [x] Install Terraform (v1.5+): https://developer.hashicorp.com/terraform/install
-- [x] Install dbt-core + dbt-bigquery: `pip install dbt-core dbt-bigquery`
-- [x] Install Python 3.10+ (for Airflow DAGs and ingestion scripts)
-- [x] Create a GitHub repository for this project
+### 0.2 Install Local Tooling
+- [ ] Install the [Google Cloud SDK (gcloud CLI)](https://cloud.google.com/sdk/docs/install)
+- [ ] Run `gcloud init` and authenticate with your account
+- [ ] Set default project: `gcloud config set project <PROJECT_ID>`
+- [ ] Install Terraform (v1.5+): https://developer.hashicorp.com/terraform/install
+- [ ] Install dbt-core + dbt-bigquery: `pip install dbt-core dbt-bigquery`
+- [ ] Install Python 3.10+
+- [ ] Create a GitHub repository for this project
 
-> **Why gcloud CLI?** It's your Swiss Army knife for GCP — authentication, API enablement, debugging, and quick ad-hoc commands. Terraform handles infrastructure, but gcloud fills in the gaps.
+### 0.3 Enable Required GCP APIs
 
-### 0.4 Enable Required GCP APIs ✅
+**Why enable APIs?** GCP follows a "disabled by default" model. Each service has an API that must be explicitly turned on before Terraform or any other tool can manage resources for it.
 
-**Why enable APIs?** GCP follows a "disabled by default" model. Each service (BigQuery, GCS, IAM, etc.) has an API that must be explicitly turned on before you can use it. This is a security feature — you only expose the surface area you need.
-
-- [x] Enable APIs via gcloud (or Terraform later):
+- [ ] Enable APIs via gcloud:
   ```bash
   gcloud services enable \
     bigquery.googleapis.com \
@@ -60,33 +53,34 @@ End-to-end data engineering project on GCP: ingest MusicBrainz data (initial bul
     run.googleapis.com
   ```
 
-> **Note**: `run.googleapis.com` was added after Phase 0 was completed (Cloud Run architecture decision). `cloudbuild.googleapis.com` is also required — Cloud Run's source-based deployment uses Cloud Build to build container images automatically. Enable both before starting Phase 1.
->
 > **Study**: [GCP API enablement](https://cloud.google.com/apis/docs/getting-started#enabling_apis) — what each API controls and why you need it.
 
-### 0.5 Create Service Accounts ✅
+### 0.4 Create Terraform Service Account (manual bootstrap)
 
-**Why service accounts?** In GCP, workloads (scripts, Terraform, Airflow) authenticate as *service accounts*, not as your personal user. This lets you grant fine-grained permissions and follows the principle of least privilege — each component only gets the access it needs, limiting blast radius if credentials are compromised.
+**Why manual?** This is the chicken-and-egg of IaC: Terraform needs a service account to authenticate, so this SA must exist before Terraform runs. Everything else — including the pipeline SA and all IAM bindings — will be managed by Terraform in Phase 1.
 
-- [x] Create a Terraform service account with `roles/editor` + `roles/iam.securityAdmin`
-- [x] Create a pipeline service account (used by Airflow/dbt/Cloud Run) with least-privilege roles:
-  - `roles/bigquery.dataEditor` — read/write BigQuery tables
-  - `roles/bigquery.jobUser` — run BigQuery queries
-  - `roles/storage.objectAdmin` — read/write GCS objects
-  - `roles/compute.instanceAdmin.v1` — manage the Airflow GCE VM
-  - `roles/run.invoker` — trigger Cloud Run jobs (used by Airflow)
-  - `roles/run.sourceDeveloper` — deploy Cloud Run jobs from source
-  - `roles/serviceusage.serviceUsageConsumer` — required for source-based deployment
-  - `roles/iam.serviceAccountUser` — attach SAs to Cloud Run jobs
-  - `roles/artifactregistry.reader` — pull built container images from Artifact Registry
-- [x] ~~Download JSON key for Terraform SA~~ — **Skipped.** No JSON keys needed. Locally, Terraform authenticates via Application Default Credentials (`gcloud auth application-default login`). In CI/CD (Phase 7), GitHub Actions will use Workload Identity Federation to impersonate the Terraform SA with short-lived tokens — more secure than long-lived key files. The org policy `constraints/iam.disableServiceAccountKeyCreation` also blocks key creation, which aligns with this approach.
-- [ ] ~~Configure Workload Identity Federation for GitHub Actions~~ — **Deferred to Phase 7.** WIF is only needed when GitHub Actions workflows exist. The Terraform SA will be impersonated via WIF at that point.
+- [ ] Create the Terraform SA:
+  ```bash
+  gcloud iam service-accounts create terraform-sa \
+    --display-name="Terraform Service Account"
+  ```
+- [ ] Grant it the permissions it needs to manage the project:
+  - `roles/editor` — create/manage most GCP resources
+  - `roles/iam.securityAdmin` — manage IAM bindings for other service accounts
+- [ ] Set up Application Default Credentials for local development:
+  ```bash
+  gcloud auth application-default login
+  ```
 
-> **Study**: [IAM overview](https://cloud.google.com/iam/docs/overview) — understand principals, roles, and policies. Then read [Service accounts](https://cloud.google.com/iam/docs/service-account-overview) to understand why workloads use SAs instead of user accounts.
+> **Why these roles?** `roles/editor` lets Terraform create GCS buckets, BigQuery datasets, GCE VMs, etc. `roles/iam.securityAdmin` lets Terraform assign roles to the pipeline SA. Together they cover everything Terraform needs to manage in this project.
 >
-> **Study**: [Workload Identity Federation](https://cloud.google.com/iam/docs/workload-identity-federation) — how GitHub Actions authenticates to GCP without storing long-lived keys. This is the modern best practice over JSON key files.
+> **Why no JSON key files?** Application Default Credentials (ADC) let Terraform authenticate using your local `gcloud` login — no key files to manage, rotate, or accidentally commit. In CI/CD (Phase 7), GitHub Actions will use Workload Identity Federation for the same keyless approach.
 >
-> **Study**: [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials) — how tools like Terraform discover credentials automatically without key files.
+> **Study**: [IAM overview](https://cloud.google.com/iam/docs/overview) — understand principals, roles, and policies.
+>
+> **Study**: [Service accounts](https://cloud.google.com/iam/docs/service-account-overview) — why workloads use SAs instead of user accounts.
+>
+> **Study**: [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials) — how tools discover credentials automatically.
 
 ---
 
@@ -108,39 +102,36 @@ terraform/
   terraform.tfvars     # Variable values (gitignored)
   gcs.tf               # GCS buckets
   bigquery.tf          # BigQuery datasets
-  airflow_vm.tf        # GCE VM for Airflow (e2-small, scheduling only)
-  iam.tf               # Service accounts and IAM bindings
-  outputs.tf           # Output values (bucket names, dataset IDs)
+  iam.tf               # Pipeline service account and IAM bindings
+  airflow_vm.tf        # GCE VM for Airflow (added in Phase 5)
+  outputs.tf           # Output values (bucket names, dataset IDs, SA emails)
 ```
 
 > **Why split into multiple files?** Terraform merges all `.tf` files in a directory. Splitting by resource type makes it easier to navigate and review changes. This is a common convention, not a requirement.
 
-### 1.2 Configure Terraform Backend ✅
+### 1.2 Configure Terraform Backend
 
 **Why a remote backend?** Terraform tracks what it has created in a *state file*. By default this is local (`terraform.tfstate`), but storing it in GCS means it's shared, versioned, and not lost if your machine dies. It also enables state locking to prevent concurrent modifications.
 
-- [x] Create a GCS bucket manually for Terraform state: `gs://is-rock-alive-tf-state`
-- [x] Configure remote backend in `main.tf`
-- [x] Configure the `google` provider with project, region, zone using input variables
-- [x] Create `variables.tf` (declarations) and `terraform.tfvars` (values, gitignored)
-- [x] Run `terraform init` successfully
+- [ ] Create a GCS bucket manually for Terraform state: `gs://<PROJECT_ID>-tf-state`
+- [ ] Configure remote backend in `main.tf`
+- [ ] Configure the `google` provider with project, region, zone using input variables
+- [ ] Create `variables.tf` (declarations) and `terraform.tfvars` (values, gitignored)
+- [ ] Run `terraform init` successfully
 
-> **Lesson learned**: The `backend` block does not support variables, `local`, or any expressions — only literal values. This is because Terraform evaluates the backend *before* processing the rest of the configuration. The bucket name must be hardcoded in `main.tf`.
->
-> **Lesson learned**: Don't create the state bucket with Hierarchical Namespace (HNS) enabled — HNS buckets don't support object versioning, which is recommended for state recovery.
+> **Important**: The `backend` block does not support variables or expressions — only literal values. This is because Terraform evaluates the backend *before* processing the rest of the configuration. The bucket name must be hardcoded in `main.tf`.
 >
 > **Study**: [GCS backend configuration](https://developer.hashicorp.com/terraform/language/backend/gcs)
 
-### 1.3 Provision GCS Buckets (Data Lake) ✅
+### 1.3 Provision GCS Buckets (Data Lake)
 
-**Why GCS as the raw layer?** Cloud object storage (GCS) is the standard landing zone for data lakes: it's cheap ($0.02/GB/mo for Standard), infinitely scalable, supports any file format, and integrates natively with BigQuery for loading. Raw data lives here so you always have an immutable copy of what was ingested — if your transformations have bugs, you can reprocess from raw.
+**Why GCS as the raw layer?** Cloud object storage is the standard landing zone for data lakes: it's cheap ($0.02/GB/mo for Standard), infinitely scalable, supports any file format, and integrates natively with BigQuery for loading. Raw data lives here so you always have an immutable copy of what was ingested — if your transformations have bugs, you can reprocess from raw.
 
-- [x] **Raw layer bucket**: `gs://<PROJECT_ID>-raw` — landing zone for JSONL dumps and API responses
-  - Subdirectories: `musicbrainz-dump/`, `api-incremental/`
+- [ ] **Raw bucket**: `gs://<PROJECT_ID>-raw` — landing zone for JSONL dumps and API responses
   - Lifecycle rule: transition to Nearline after 90 days
-- [x] **Staging bucket**: `gs://<PROJECT_ID>-staging` — temporary processing area
-- [x] **Airflow VM bucket** (optional): `gs://<PROJECT_ID>-airflow` — for syncing DAGs and scripts to the GCE VM
-- [x] All buckets use `uniform_bucket_level_access = true` (IAM-only, no legacy ACLs)
+- [ ] **Staging bucket**: `gs://<PROJECT_ID>-staging` — temporary processing area
+- [ ] **Airflow bucket**: `gs://<PROJECT_ID>-airflow` — for syncing DAGs and scripts to the GCE VM
+- [ ] All buckets use `uniform_bucket_level_access = true` (IAM-only, no legacy ACLs)
 
 > **Why lifecycle rules?** Old raw data is rarely re-read. Moving it automatically to cheaper storage classes (Nearline: $0.01/GB/mo) saves money without deleting anything.
 >
@@ -148,93 +139,68 @@ terraform/
 >
 > **Study**: [Object lifecycle management](https://cloud.google.com/storage/docs/lifecycle)
 >
-> **Study**: [Terraform for Cloud Storage](https://docs.cloud.google.com/storage/docs/terraform-for-cloud-storage) — how to create and manage GCS buckets with Terraform, including examples for lifecycle rules, versioning, and access control.
->
-> **Lesson learned**: Enable `uniform_bucket_level_access` on all buckets — it simplifies permissions by using IAM only (no legacy per-object ACLs), which aligns with the SA-based auth strategy. GCP recommends this for new buckets.
+> **Study**: [Terraform for Cloud Storage](https://docs.cloud.google.com/storage/docs/terraform-for-cloud-storage)
 
-### 1.4 Cloud Run Jobs (managed via `gcloud`)
-
-**Why Cloud Run Jobs?** Ingestion workloads need more memory than the e2-small Airflow VM provides. Cloud Run Jobs let you run batch workloads with up to 32 GiB of RAM, and you only pay for the execution time. Airflow stays lightweight (just the scheduler), and Cloud Run handles the heavy lifting. Running the bulk load on Cloud Run also gives you faster network (same region as GCS) and avoids consuming local resources.
-
-**Why source-based deployment?** Cloud Run supports deploying directly from source code (`gcloud run jobs deploy --source`). Cloud Run uses Cloud Build and Google Cloud Buildpacks to automatically build a container image from your Python source, stores it in an auto-managed Artifact Registry repository (`cloud-run-source-deploy`), and deploys it — no Dockerfile, manual image build, or registry management needed. This simplifies the deployment workflow significantly for straightforward Python scripts.
-
-**Why manage Cloud Run via `gcloud`?** Source-based deployment creates the job *and* builds the container image in one step. Since the jobs don't exist until you have source code to deploy (Phases 2 and 3), and `gcloud run jobs deploy` is an upsert (creates on first run, updates on subsequent runs), managing Cloud Run Jobs entirely through `gcloud` is the simplest and most natural approach.
-
-Cloud Run Jobs will be deployed in their respective phases:
-- `musicbrainz-bulk-load` — deployed from source in Phase 2
-  - Handles: downloading tar.xz dumps, stream-extracting, uploading JSONL chunks to GCS, loading into BigQuery
-  - Memory/CPU: tune based on stream extraction needs (see CPU-to-memory constraints below)
-  - Timeout: up to 168 hours / 7 days (adjust based on total ingestion duration)
-  - Execution SA: pipeline service account
-- `musicbrainz-incremental` — deployed from source in Phase 3
-  - Handles: API pagination, rate limiting, watermark tracking, GCS upload, BigQuery load
-  - Memory: up to 32 GiB (tune based on actual dlt needs)
-  - CPU: 4-8 vCPUs
-  - Timeout: up to 168 hours / 7 days
-  - Execution SA: pipeline service account
-
-**CPU-to-memory constraints** (hard limits enforced by Cloud Run):
-
-| CPU | Max memory |
-|-----|-----------|
-| 1 vCPU | 4 GiB |
-| 2 vCPU | 8 GiB |
-| 4 vCPU | 16 GiB |
-| 8 vCPU | 32 GiB |
-
-**Source directory requirements**: Each job's source directory must contain:
-- The Python script (e.g., `bulk_load.py`)
-- `requirements.txt` with dependencies
-- `Procfile` specifying the entry point (e.g., `web: python3 bulk_load.py`) — required by Buildpacks even for jobs
-
-**IAM for deployment**: The pipeline SA already has the required roles (granted in Phase 0.5): `roles/run.sourceDeveloper`, `roles/serviceusage.serviceUsageConsumer`, `roles/iam.serviceAccountUser`, and `roles/artifactregistry.reader`. The Cloud Build service agent needs `roles/run.builder`.
-
-> **Important**: Use `gcloud run jobs deploy` (not `gcloud run deploy`). `gcloud run deploy` creates a *Service* (HTTP endpoint with autoscaling). `gcloud run jobs deploy` creates a *Job* (runs to completion and exits). Both support `--source`, but they create different resource types.
->
-> **Study**: [Cloud Run Jobs overview](https://cloud.google.com/run/docs/create-jobs) — how jobs differ from services, execution environment, and configuration options.
->
-> **Study**: [Cloud Run source-based deployment](https://cloud.google.com/run/docs/deploying-source-code) — how `gcloud run jobs deploy --source` works, prerequisites, and buildpack configuration.
->
-> **Study**: [Executing jobs](https://cloud.google.com/run/docs/execute/jobs) — how to trigger, monitor, and override job executions.
->
-> **Study**: [Google Cloud Buildpacks](https://cloud.google.com/docs/buildpacks/overview) — how buildpacks auto-detect your language and build optimized container images. For Python, detection relies on `requirements.txt`.
->
-> **Study**: [Cloud Run CPU and memory configuration](https://cloud.google.com/run/docs/configuring/memory-limits) — valid CPU-to-memory combinations and how to set them.
-
-### 1.5 Provision BigQuery Datasets
+### 1.4 Provision BigQuery Datasets
 
 **Why BigQuery?** It's a serverless, columnar data warehouse that scales to petabytes with zero infrastructure management. You pay per query (first 1 TB/mo free) and per storage (first 10 GB/mo free). For analytics workloads, it's the natural choice on GCP.
 
 **Why multiple datasets?** Datasets in BigQuery are like schemas in PostgreSQL — they're organizational units with independent access controls. Separating raw/staging/curated/analytics lets you grant different permissions (e.g., Looker Studio only reads `analytics`) and makes the data lineage visible.
 
-- [ ] `raw` dataset — external tables or raw loaded data from GCS
-- [ ] `staging` dataset — intermediate dbt models (ephemeral/views)
+- [ ] `raw` dataset — loaded data from GCS JSONL files
+- [ ] `staging` dataset — intermediate dbt models (views)
 - [ ] `curated` dataset — cleaned, deduplicated, typed tables (dbt models)
-- [ ] `analytics` dataset — final star schema / aggregated tables for Looker Studio
-- [ ] Set dataset location to `US` (matches GCS region for free data transfer)
-- [ ] Apply: `terraform plan && terraform apply`
+- [ ] `analytics` dataset — final aggregated tables for Looker Studio
+- [ ] Set dataset location to `US` (multi-region, for free data transfer from `us-central1` GCS buckets)
 
 > **Why does location matter?** BigQuery charges for cross-region data transfer. If your GCS bucket is in `us-central1` and your BigQuery dataset is in `US` multi-region, the transfer is free. Mixing regions (e.g., EU dataset with US bucket) incurs egress costs.
 >
 > **Study**: [BigQuery introduction](https://cloud.google.com/bigquery/docs/introduction) — architecture, slots, storage, and pricing model.
 >
-> **Study**: [Medallion architecture](https://www.databricks.com/glossary/medallion-architecture) — the bronze/silver/gold (raw/curated/analytics) pattern we're using. Originally from Databricks but widely adopted.
+> **Study**: [Medallion architecture](https://www.databricks.com/glossary/medallion-architecture) — the bronze/silver/gold (raw/curated/analytics) pattern. Originally from Databricks but widely adopted.
+
+### 1.5 IAM: Pipeline Service Account & Role Bindings
+
+**Why manage IAM in Terraform?** Service accounts and their role bindings are infrastructure. Managing them in Terraform means anyone who clones the repo gets the complete picture — not just the buckets and datasets, but also *who* can access them and with what permissions. It also makes IAM changes auditable through git history.
+
+**Why a separate pipeline SA?** The pipeline SA is used by Airflow, dbt, Cloud Run Jobs, and any runtime workload. It gets only the permissions these workloads need — not the broad `roles/editor` that the Terraform SA has. This follows the principle of least privilege.
+
+- [ ] Create the pipeline service account (`pipeline-sa`) via Terraform
+- [ ] Bind the following roles to the pipeline SA using additive IAM resources:
+  - `roles/bigquery.dataEditor` — read/write BigQuery tables
+  - `roles/bigquery.jobUser` — run BigQuery queries
+  - `roles/storage.objectAdmin` — read/write GCS objects
+  - `roles/compute.instanceAdmin.v1` — manage the Airflow GCE VM
+  - `roles/run.invoker` — trigger Cloud Run jobs (used by Airflow)
+  - `roles/run.sourceDeveloper` — deploy Cloud Run jobs from source
+  - `roles/serviceusage.serviceUsageConsumer` — required for source-based deployment
+  - `roles/iam.serviceAccountUser` — attach SAs to Cloud Run jobs
+  - `roles/artifactregistry.reader` — pull built container images from Artifact Registry
+
+> **Critical concept — IAM binding types in Terraform**: Terraform offers three IAM resources for GCP. Picking the wrong one can lock you out of your project or strip permissions from other principals:
 >
+> - `google_project_iam_policy` — **fully authoritative**: replaces ALL bindings for ALL roles in the project. Use this and you'll wipe out your own user permissions and any Google-managed SAs.
+> - `google_project_iam_binding` — **authoritative per role**: replaces all members for a specific role. Dangerous if other principals (like your user account) also hold that role.
+> - `google_project_iam_member` — **additive**: adds one member to one role without touching anything else. This is the safest option for a project where your personal user account and Google-managed SAs also need to retain access.
+>
+> **Study**: [Terraform google_project_iam docs](https://registry.terraform.io/providers/hashicorp/google/latest/docs/resources/google_project_iam) — read the warnings at the top carefully.
+>
+> **Study**: [Terraform google_service_account](https://registry.terraform.io/providers/hashicorp/google/latest/docs/resources/google_service_account)
+
+### 1.6 Outputs
+
+- [ ] Create `outputs.tf` with useful values: bucket names, dataset IDs, pipeline SA email
+- [ ] These outputs can be referenced by scripts and CI/CD pipelines
+
+> **Study**: [Terraform outputs](https://developer.hashicorp.com/terraform/language/values/outputs)
+
+### 1.7 Apply and Verify
+
+- [ ] Run `terraform plan` — review every resource that will be created
+- [ ] Run `terraform apply` — provision all resources
+- [ ] Verify in the GCP Console: buckets, datasets, SA, and role bindings exist
+
 > **Study**: [Terraform plan/apply workflow](https://developer.hashicorp.com/terraform/cli/run) — always `plan` before `apply` to see what will change. Treat `plan` output like a code diff.
-
-### 1.6 Local Airflow with Docker (Development)
-
-**Why start local?** For development and learning, a local Airflow instance in Docker is free and gives you the same DAG authoring experience. Once your DAGs are stable, you'll deploy to a GCE e2-small VM (~$15-30/mo) for production scheduling.
-
-- [ ] Create `docker-compose.yml` for local Airflow (use the [official Airflow Docker Compose](https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html))
-- [ ] Mount local `dags/` and `scripts/` directories into the container
-- [ ] Configure Airflow to use your GCP service account for BigQuery/GCS access
-- [ ] Verify the Airflow UI is accessible at `localhost:8080`
-
-> **Study**: [Running Airflow in Docker](https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html) — official guide for the Docker Compose setup.
->
-> **Study**: [Airflow concepts](https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/index.html) — DAGs, tasks, operators, sensors, XComs. Understand these before writing your first DAG.
-
 
 ---
 
@@ -242,19 +208,13 @@ Cloud Run Jobs will be deployed in their respective phases:
 
 **Why a bulk load first?** The MusicBrainz database has millions of records spanning decades. Starting from a full dump gives you a complete historical baseline immediately, rather than trying to backfill years of data through the rate-limited API (1 req/sec). The API is then used only for incremental updates going forward.
 
-> **Study**: [MusicBrainz database documentation](https://musicbrainz.org/doc/MusicBrainz_Database) — understand what's in the dump, how often it's published, and the data model.
->
-> **Study**: [MusicBrainz schema diagram](https://musicbrainz.org/doc/MusicBrainz_Database/Schema) — the entity relationships. This is critical for understanding how artists, releases, labels, and tags connect.
+**Why simple Python scripts (no dlt)?** The initial dump load is a one-time operation. Using dlt would be over-engineering. Simple Python scripts with `google-cloud-storage` and `google-cloud-bigquery` give you direct experience with core GCP client libraries and full control over stream extraction and chunking. dlt's strengths (pagination, rate limiting, watermarks, schema evolution) are a natural fit for the incremental API pipeline in Phase 4.
 
-### Design Decisions (Resolved)
+**Why Cloud Run Jobs?** Ingestion workloads need significant memory for stream-extracting large tar.xz files. Cloud Run Jobs provide up to 32 GiB RAM, fast network (same region as GCS), and pay-per-use billing. The Airflow VM stays lightweight (just scheduling).
 
-> **JSONL vs. Parquet for the raw layer**: JSONL is the preferred format for the raw GCS landing zone. Reasons: (1) it matches the source format (MusicBrainz dumps are JSONL), keeping raw faithful to the source; (2) schema-on-read — JSONL tolerates inconsistent/optional fields across records without schema merge issues that Parquet would introduce across multiple files; (3) BigQuery load jobs ingest JSONL natively and for free; (4) raw data is rarely re-read (it's an archive/reprocessing safety net), so Parquet's I/O and compression advantages matter less here. Parquet is better suited for curated/analytics layers where the schema is stable and data is read repeatedly.
+> **Study**: [MusicBrainz database documentation](https://musicbrainz.org/doc/MusicBrainz_Database) — what's in the dump, how often it's published, and the data model.
 >
-> **No dlt for the bulk load**: The initial dump load is a one-time operation — using dlt would be over-engineering. Simple Python scripts with `google-cloud-storage` and `google-cloud-bigquery` give you direct experience with core GCP client libraries, full control over stream extraction and chunking, and a cleaner separation of tools (bulk load = Python scripts, incremental = dlt, transformation = dbt). The script runs as a Cloud Run Job (deployed from source, same region as GCS for fast network, no local resource constraints). dlt's strengths (pagination, rate limiting, watermarks, schema evolution) are a natural fit for the incremental API pipeline in Phase 3.
->
-> **dlt normalization (for Phase 3 incremental)**: Disable dlt normalization and keep raw data as-is. dbt owns all transformation logic in one place (staging layer). Splitting transformation across dlt + dbt makes debugging and maintenance harder.
->
-> **Study**: [dlt normalization docs](https://dlthub.com/docs/general-usage/schema#data-normalizer) — how to configure or disable normalization behavior.
+> **Study**: [MusicBrainz schema diagram](https://musicbrainz.org/doc/MusicBrainz_Database/Schema) — entity relationships. Critical for understanding how artists, releases, labels, and tags connect.
 
 ### 2.1 Explore MusicBrainz Data Dump
 - [ ] Explore the dump index at https://data.metabrainz.org/pub/musicbrainz/data/json-dumps/
@@ -264,18 +224,16 @@ Cloud Run Jobs will be deployed in their respective phases:
   - `event.tar.xz` (~42 MB compressed) — name, type, begin/end dates, place
 - [ ] Download a small sample locally (e.g., `event.tar.xz` at 42 MB) to inspect the structure
 - [ ] The dumps are `tar.xz` files containing a single JSONL file inside `mbdump/<entity>`
-- [ ] Inspect a few lines to understand the nested structure (each record contains embedded objects for relations, genres, tags, aliases, area, life-span, etc.)
+- [ ] Inspect a few lines to understand the nested structure (relations, genres, tags, aliases, area, life-span are all embedded)
 - [ ] Note: genres/tags are embedded inside artist and release-group records — there's no separate genre dump. The dbt staging layer will extract these into dedicated models.
 
-> **Why JSONL?** JSON Lines (one JSON object per line) is ideal for big data pipelines: it's streamable (no need to parse the whole file), splittable (each line is independent), and directly supported by BigQuery load jobs.
+> **Why JSONL?** JSON Lines (one JSON object per line) is ideal for big data pipelines: it's streamable, splittable, and directly supported by BigQuery load jobs.
 >
-> **Data sizes**: The target entities total ~3.4 GB compressed. The deeply nested JSON (especially artist relations) will expand significantly when decompressed — the script handles this via stream extraction, avoiding full decompression to disk.
->
-> **Note**: You don't need to download the full dumps to your machine — the Cloud Run Job will download them directly from MusicBrainz. Local exploration is just for understanding the data structure.
+> **Data sizes**: The target entities total ~3.4 GB compressed. The deeply nested JSON (especially artist relations) expands significantly when decompressed — the script handles this via stream extraction, avoiding full decompression to disk.
 
 ### 2.2 Write the Bulk Load Script
 - [ ] Write a Python script (`scripts/bulk_load.py`) that handles the full pipeline:
-  1. **Download**: Stream the tar.xz directly from MusicBrainz (no need to save the full archive)
+  1. **Download**: Stream the tar.xz directly from MusicBrainz
   2. **Extract**: Stream-extract the JSONL using Python's `tarfile` module (avoid decompressing fully to disk)
   3. **Upload**: Upload JSONL chunks (~100 MB each) to `gs://<PROJECT_ID>-raw/musicbrainz-dump/<entity>/`
   4. **Load**: Create BigQuery load jobs from the GCS chunks into `raw.<entity>` tables
@@ -285,104 +243,62 @@ Cloud Run Jobs will be deployed in their respective phases:
 - [ ] Write disposition: WRITE_TRUNCATE (full replace for initial load)
 - [ ] Target entities: artist, release-group, label, event
 
-> **Why one script?** The download → extract → upload → load steps are sequential per entity and run together as a single Cloud Run Job execution. Keeping them in one script simplifies the container and avoids intermediate state management.
+> **Why stream-extract?** The artist dump alone is ~2 GB compressed and could expand to 15-20 GB. Streaming through `tarfile` avoids needing that disk space — you read the compressed archive and upload chunks directly to GCS.
 >
-> **Why stream-extract?** The artist dump alone is ~2 GB compressed and could expand to 15-20 GB of deeply nested JSON. Streaming through Python's `tarfile` module avoids needing that disk space — you read the compressed archive and upload chunks directly to GCS.
+> **Why chunk large files?** BigQuery load jobs perform better with files in the 100 MB–1 GB range. Too many tiny files = overhead; one huge file = no parallelism. Chunking also gives natural restart points if an upload fails.
 >
-> **Why chunk large files?** BigQuery load jobs perform better with files in the 100 MB–1 GB range. Too many tiny files = overhead; one huge file = no parallelism. Chunking also gives you natural restart points if an upload fails.
+> **Study**: [Python tarfile module](https://docs.python.org/3/library/tarfile.html) — streaming mode for tar archives.
 >
-> **Why WRITE_TRUNCATE?** For the initial load, you want a clean slate. TRUNCATE replaces the entire table. For incrementals later, you'll use WRITE_APPEND.
->
-> **Why validate row counts?** Data ingestion can silently drop rows (malformed JSON, encoding issues). Comparing your counts to MusicBrainz's published stats catches these problems early.
->
-> **Study**: [Python tarfile module](https://docs.python.org/3/library/tarfile.html) — how to read tar archives in streaming mode.
->
-> **Study**: [google-cloud-storage Python client](https://cloud.google.com/storage/docs/reference/libraries#client-libraries-install-python) — specifically `Blob.upload_from_file()` for streaming uploads.
+> **Study**: [google-cloud-storage Python client](https://cloud.google.com/storage/docs/reference/libraries#client-libraries-install-python) — `Blob.upload_from_file()` for streaming uploads.
 >
 > **Study**: [Loading JSON data into BigQuery](https://cloud.google.com/bigquery/docs/loading-data-cloud-storage-json)
 >
-> **Study**: [BigQuery Python client](https://cloud.google.com/bigquery/docs/reference/libraries#client-libraries-install-python) — specifically `LoadJobConfig` and `load_table_from_uri`.
+> **Study**: [BigQuery Python client](https://cloud.google.com/bigquery/docs/reference/libraries#client-libraries-install-python) — `LoadJobConfig` and `load_table_from_uri`.
 
-### 2.3 Deploy and Execute
+### 2.3 Deploy and Execute on Cloud Run
+
+**Why source-based deployment?** Instead of writing a Dockerfile, building an image, and pushing it to a registry, `gcloud run jobs deploy --source` handles all of that automatically. Cloud Run uses Google Cloud Buildpacks to detect your Python project (via `requirements.txt` and `Procfile`), build a container image, store it in an auto-managed Artifact Registry repository, and deploy it.
+
 - [ ] Prepare the source directory with:
   - `bulk_load.py` (the script)
-  - `requirements.txt` listing dependencies (`google-cloud-storage`, `google-cloud-bigquery`)
+  - `requirements.txt` (`google-cloud-storage`, `google-cloud-bigquery`)
   - `Procfile` specifying the entry point (e.g., `web: python3 bulk_load.py`)
-- [ ] Deploy the bulk load script to Cloud Run using source-based deployment (`gcloud run jobs deploy --source`)
-  - Cloud Build + Buildpacks will automatically build the container image from your Python source
-  - Configure memory, CPU, timeout, and service account for the job
-- [ ] Execute the Cloud Run Job (`musicbrainz-bulk-load`) — trigger manually via `gcloud run jobs execute` or the console
-- [ ] Monitor execution in the Cloud Run logs
+- [ ] Deploy using `gcloud run jobs deploy --source`, configuring memory, CPU, timeout, and service account
+- [ ] Execute the job via `gcloud run jobs execute`
+- [ ] Monitor execution in Cloud Run logs
 
-> **Why source-based deployment?** Instead of writing a Dockerfile, building an image, and pushing it to a registry manually, `gcloud run jobs deploy --source` handles all of that automatically. Cloud Run uses Google Cloud Buildpacks to detect your Python project (via `requirements.txt` and `Procfile`), build a production-ready container image, store it in an auto-managed Artifact Registry repository, and deploy it. This is the simplest path for standard Python scripts.
+> **Important**: Use `gcloud run jobs deploy` (not `gcloud run deploy`). The `jobs` subcommand creates a Job (runs to completion and exits). `gcloud run deploy` creates a Service (HTTP endpoint with autoscaling). Both support `--source`, but they create different resource types.
 >
-> **Important**: Use `gcloud run jobs deploy` (not `gcloud run deploy`) — the `jobs` subcommand creates a Job resource (runs to completion), while `gcloud run deploy` creates a Service (HTTP endpoint). See Phase 1.4 for details.
+> **CPU-to-memory constraints** (hard limits enforced by Cloud Run):
 >
-> **Study**: [Cloud Run source-based deployment](https://cloud.google.com/run/docs/deploying-source-code) — how to deploy from source, buildpack detection, and configuration options.
+> | CPU | Max memory |
+> |-----|-----------|
+> | 1 vCPU | 4 GiB |
+> | 2 vCPU | 8 GiB |
+> | 4 vCPU | 16 GiB |
+> | 8 vCPU | 32 GiB |
 >
-> **Study**: [Google Cloud Buildpacks](https://cloud.google.com/docs/buildpacks/overview) — how buildpacks auto-detect your language and build optimized container images.
+> **Study**: [Cloud Run Jobs overview](https://cloud.google.com/run/docs/create-jobs) — how jobs differ from services.
+>
+> **Study**: [Cloud Run source-based deployment](https://cloud.google.com/run/docs/deploying-source-code) — prerequisites and buildpack configuration.
+>
+> **Study**: [Google Cloud Buildpacks](https://cloud.google.com/docs/buildpacks/overview) — how buildpacks auto-detect your language. For Python, detection relies on `requirements.txt`.
+>
+> **Study**: [Cloud Run CPU and memory configuration](https://cloud.google.com/run/docs/configuring/memory-limits) — valid CPU-to-memory combinations.
 
 ---
 
-## Phase 3: Data Ingestion - Incremental API Loads
-
-**Why incremental loads?** MusicBrainz is a living database — new artists debut, albums get released, and metadata gets corrected daily. Incremental loads keep your warehouse current without re-ingesting the entire dump each time. This is the standard ELT pattern: extract changes, load them, then let dbt handle deduplication and merging.
-
-> **Study**: [Change Data Capture patterns](https://www.confluent.io/learn/change-data-capture/) — understand CDC concepts (watermarks, timestamps, event logs). The MusicBrainz API doesn't offer true CDC, so you'll use timestamp-based watermarks.
-
-### 3.1 Understand MusicBrainz API
-- [ ] Read API docs: https://musicbrainz.org/doc/MusicBrainz_API
-- [ ] Rate limit: 1 request/second (respect this strictly with a custom User-Agent)
-- [ ] Register your app and set a descriptive User-Agent header
-- [ ] Key endpoints:
-  - `GET /ws/2/artist?query=*&fmt=json&offset=N&limit=100`
-  - `GET /ws/2/release-group?query=*&fmt=json`
-  - Browse endpoints with `inc=` for related data (tags, ratings)
-
-> **Why respect rate limits?** MusicBrainz is a community-run non-profit. Exceeding rate limits gets your IP banned and hurts the service for everyone. Always include a User-Agent with your app name and contact info.
->
-> **Study**: [MusicBrainz API rate limiting](https://musicbrainz.org/doc/MusicBrainz_API/Rate_Limiting)
->
-> **Study**: [MusicBrainz API search syntax](https://musicbrainz.org/doc/MusicBrainz_API/Search) — Lucene query syntax for filtering entities.
-
-### 3.2 Build Incremental Ingestion Script
-
-**Why watermarks?** A watermark is a bookmark that says "I've ingested everything up to this timestamp." Each run picks up from the last watermark, processes new/updated records, then advances the watermark. This ensures no gaps and no duplicate processing windows (though individual records may still need deduplication).
-
-- [ ] Write `scripts/incremental_ingest.py`:
-  - Query the MusicBrainz API for recently updated entities (using `last-updated` or browse with offset)
-  - Write responses as JSONL to `gs://<PROJECT_ID>-raw/api-incremental/<entity>/<date>/`
-  - Track watermarks (last sync timestamp) in a BigQuery control table or GCS metadata file
-  - Handle pagination, retries, and rate limiting
-- [ ] Target entities: artists, release_groups, labels, events
-- [ ] Schedule: daily incremental pulls
-
-> **Why write to GCS before BigQuery?** This is the "ELT" pattern: raw data always lands in the lake (GCS) first, then gets loaded to the warehouse. If a BigQuery load fails, you don't need to re-fetch from the API — the data is already in GCS.
->
-> **Why partition by date?** Storing incrementals as `api-incremental/artist/2026-03-07/data.jsonl` makes it easy to reprocess a specific day, debug issues, and track what was ingested when.
-
-### 3.3 Load Incremental Data to BigQuery
-- [ ] Append new records to `raw.<entity>` tables (WRITE_APPEND)
-- [ ] Use the `_load_timestamp` column to track when records were ingested
-- [ ] Deduplication happens in the dbt staging layer
-
-> **Why append instead of upsert at the raw layer?** Keeping raw as append-only preserves history and makes the ingestion layer simple. If the same artist appears 3 times (from 3 daily loads), all 3 rows are kept in raw. The dbt staging layer then deduplicates by taking the latest record per MBID. This separation of concerns makes debugging much easier.
->
-> **Study**: [ELT vs. ETL](https://www.getdbt.com/analytics-engineering/elt-vs-etl) — dbt's explanation of why modern pipelines prefer loading raw data first and transforming inside the warehouse.
-
----
-
-## Phase 4: Data Transformation with dbt
+## Phase 3: Data Transformation with dbt
 
 **Why dbt?** dbt (data build tool) brings software engineering practices to SQL transformations: version control, modularity, testing, documentation, and dependency management. Instead of writing one giant SQL script, you write modular models that dbt compiles and runs in dependency order. It's the industry standard for the "T" in ELT.
 
 > **Study**: [dbt Fundamentals course](https://courses.getdbt.com/courses/fundamentals) — **free official course**, highly recommended. Covers models, tests, documentation, and sources.
 >
-> **Study**: [dbt best practices](https://docs.getdbt.com/best-practices/how-we-structure/1-guide-overview) — the official "How we structure our dbt projects" guide. Our staging/curated/analytics layers follow this pattern.
+> **Study**: [dbt best practices](https://docs.getdbt.com/best-practices/how-we-structure/1-guide-overview) — the official "How we structure our dbt projects" guide. The staging/curated/analytics layers follow this pattern.
 >
 > **Study**: [dbt and BigQuery setup](https://docs.getdbt.com/docs/core/connect-data-platform/bigquery-setup)
 
-### 4.1 Initialize dbt Project
+### 3.1 Initialize dbt Project
 - [ ] Run `dbt init musicbrainz` inside the project directory
 - [ ] Configure `profiles.yml` for BigQuery connection (OAuth via Application Default Credentials)
 - [ ] Project structure:
@@ -396,7 +312,7 @@ Cloud Run Jobs will be deployed in their respective phases:
       analytics/          # final tables for dashboards
     tests/                # custom data tests
     macros/               # reusable SQL macros
-    seeds/                # static reference data (genre mappings, etc.)
+    seeds/                # static reference data (genre mappings)
   ```
 
 > **Why this three-layer structure?**
@@ -404,7 +320,7 @@ Cloud Run Jobs will be deployed in their respective phases:
 > - **Curated**: business logic lives here — deduplication, joins, dimensional modeling. These are your "source of truth" tables.
 > - **Analytics**: pre-aggregated tables optimized for specific dashboard queries. Keeps Looker Studio fast by avoiding complex JOINs at query time.
 
-### 4.2 Staging Models (raw -> staging)
+### 3.2 Staging Models (raw -> staging)
 - [ ] `stg_artists` — parse JSON, cast types, rename columns, add surrogate keys
 - [ ] `stg_release_groups` — normalize release types, extract year from date
 - [ ] `stg_labels` — clean label data
@@ -415,13 +331,20 @@ Cloud Run Jobs will be deployed in their respective phases:
 
 > **Why views for staging?** Views don't store data — they're computed on read. Since staging models just rename/cast columns, there's no performance benefit to materializing them as tables. This saves storage cost and ensures staging always reflects the latest raw data.
 >
-> **Study**: [dbt materializations](https://docs.getdbt.com/docs/build/materializations) — view, table, incremental, and ephemeral. Choosing the right one is a key dbt skill.
+> **Study**: [dbt materializations](https://docs.getdbt.com/docs/build/materializations) — view, table, incremental, and ephemeral.
 >
-> **Study**: [BigQuery STRUCT and ARRAY types](https://cloud.google.com/bigquery/docs/nested-repeated) — how BigQuery handles nested/repeated data natively and how to query it. Important for deciding whether to flatten nested MusicBrainz fields in staging or preserve them.
->
-> **Study**: [Dremel: Interactive Analysis of Web-Scale Datasets](https://research.google/pubs/dremel-interactive-analysis-of-web-scale-datasets/) — the Google research paper behind BigQuery's columnar format. Explains why nested/repeated fields are a first-class citizen in BigQuery, not a workaround.
+> **Study**: [BigQuery STRUCT and ARRAY types](https://cloud.google.com/bigquery/docs/nested-repeated) — how BigQuery handles nested/repeated data natively. Important for deciding whether to flatten nested MusicBrainz fields.
 
-### 4.3 Curated Models (staging -> curated)
+### 3.3 Seeds (Genre Mapping)
+
+**Why seeds for genre mapping?** MusicBrainz uses free-form tags, not a controlled genre vocabulary. "hard rock", "Hard Rock", "classic rock", "progressive rock" are all separate tags. A seed CSV lets you define a curated mapping (tag -> parent genre) that lives in version control and can be reviewed/updated like code.
+
+- [ ] `genre_mapping.csv` — mapping of raw MusicBrainz tags to standardized genre categories (e.g., map "hard rock", "classic rock", "alternative rock" -> parent "Rock")
+- [ ] `release_type_mapping.csv` — if needed for normalization
+
+> **Study**: [dbt seeds](https://docs.getdbt.com/docs/build/seeds) — when to use seeds vs. source tables. Seeds are for small, static reference data that changes rarely.
+
+### 3.4 Curated Models (staging -> curated)
 
 **Why dimensional modeling?** The star schema (fact tables surrounded by dimension tables) is the gold standard for analytics. Dimension tables describe the "what" (who is the artist, what is the album), while fact tables capture the "events" (an artist released an album in this year with these genres). This structure makes dashboard queries fast and intuitive.
 
@@ -435,13 +358,13 @@ Cloud Run Jobs will be deployed in their respective phases:
 - [ ] `bridge_release_group_genre` — many-to-many: release_group <-> genre
 - [ ] Materialization: `table` or `incremental` (for large tables)
 
-> **Why bridge tables?** An artist can have multiple genres, and a genre can have multiple artists — that's a many-to-many relationship. Bridge tables resolve this by storing one row per artist-genre pair. Without them, you'd need arrays or repeated JOINs.
+> **Why bridge tables?** An artist can have multiple genres, and a genre can have multiple artists — that's a many-to-many relationship. Bridge tables resolve this by storing one row per artist-genre pair.
 >
-> **Study**: [Kimball's dimensional modeling](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/) — the foundational methodology. Focus on star schemas, slowly changing dimensions, and fact table design.
+> **Study**: [Kimball's dimensional modeling](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/) — star schemas, slowly changing dimensions, and fact table design.
 >
-> **Study**: [dbt incremental models](https://docs.getdbt.com/docs/build/incremental-models) — for large tables, incremental models only process new/changed rows instead of rebuilding the entire table.
+> **Study**: [dbt incremental models](https://docs.getdbt.com/docs/build/incremental-models) — for large tables, only process new/changed rows instead of rebuilding.
 
-### 4.4 Analytics Models (curated -> analytics)
+### 3.5 Analytics Models (curated -> analytics)
 - [ ] `rock_artists_by_year` — count of rock artists with first release per year
 - [ ] `rock_albums_by_year` — count of rock release groups per year
 - [ ] `rock_albums_by_subgenre_year` — breakdown by rock subgenres over time
@@ -450,11 +373,11 @@ Cloud Run Jobs will be deployed in their respective phases:
 - [ ] `genre_evolution` — how genre tag usage changes over time
 - [ ] Materialization: `table`
 
-> **Why pre-aggregate?** Looker Studio (and most BI tools) perform best when they query pre-aggregated tables rather than running complex JOINs and GROUP BYs on the fly. These analytics models are the "contract" between your data warehouse and your dashboard.
+> **Why pre-aggregate?** BI tools perform best when they query pre-aggregated tables rather than running complex JOINs and GROUP BYs on the fly. These analytics models are the "contract" between your data warehouse and your dashboard.
 
-### 4.5 dbt Tests
+### 3.6 dbt Tests
 
-**Why test data?** Bad data is silent — a broken JOIN produces zero rows, not an error. dbt tests catch issues like duplicate primary keys, null values in required columns, and broken foreign key relationships. Running tests after every `dbt run` is your quality gate.
+**Why test data?** Bad data is silent — a broken JOIN produces zero rows, not an error. dbt tests catch issues like duplicate primary keys, null values in required columns, and broken foreign key relationships.
 
 - [ ] Add `schema.yml` for every model with:
   - `unique` tests on primary keys
@@ -470,93 +393,151 @@ Cloud Run Jobs will be deployed in their respective phases:
 >
 > **Study**: [dbt sources and freshness](https://docs.getdbt.com/docs/build/sources) — declare your raw tables as sources and check that data isn't stale.
 
-### 4.6 dbt Seeds
+---
 
-**Why seeds for genre mapping?** MusicBrainz uses free-form tags, not a controlled genre vocabulary. "hard rock", "Hard Rock", "classic rock", "progressive rock" are all separate tags. A seed CSV lets you define a curated mapping (tag -> parent genre) that lives in version control and can be reviewed/updated like code.
+## Phase 4: Data Ingestion - Incremental API Loads
 
-- [ ] `genre_mapping.csv` — mapping of raw MusicBrainz tags to standardized genre categories (e.g., map "hard rock", "classic rock", "alternative rock" -> parent "Rock")
-- [ ] `release_type_mapping.csv` — if needed for normalization
+**Why incremental loads?** MusicBrainz is a living database — new artists debut, albums get released, and metadata gets corrected daily. Incremental loads keep your warehouse current without re-ingesting the entire dump each time.
 
-> **Study**: [dbt seeds](https://docs.getdbt.com/docs/build/seeds) — when to use seeds vs. source tables. Seeds are for small, static reference data that changes rarely.
+**Why dlt?** For the incremental pipeline, dlt's strengths shine: built-in pagination, rate limiting, watermark tracking, and schema evolution. These are exactly the problems you'd otherwise have to solve manually for an ongoing API integration.
+
+> **Study**: [Change Data Capture patterns](https://www.confluent.io/learn/change-data-capture/) — understand CDC concepts (watermarks, timestamps, event logs). The MusicBrainz API doesn't offer true CDC, so you'll use timestamp-based watermarks.
+>
+> **Study**: [dlt documentation](https://dlthub.com/docs/intro) — getting started with dlt for data ingestion.
+
+### 4.1 Understand MusicBrainz API
+- [ ] Read API docs: https://musicbrainz.org/doc/MusicBrainz_API
+- [ ] Rate limit: 1 request/second (respect this strictly with a custom User-Agent)
+- [ ] Register your app and set a descriptive User-Agent header
+- [ ] Key endpoints:
+  - `GET /ws/2/artist?query=*&fmt=json&offset=N&limit=100`
+  - `GET /ws/2/release-group?query=*&fmt=json`
+  - Browse endpoints with `inc=` for related data (tags, ratings)
+
+> **Why respect rate limits?** MusicBrainz is a community-run non-profit. Exceeding rate limits gets your IP banned and hurts the service for everyone.
+>
+> **Study**: [MusicBrainz API rate limiting](https://musicbrainz.org/doc/MusicBrainz_API/Rate_Limiting)
+>
+> **Study**: [MusicBrainz API search syntax](https://musicbrainz.org/doc/MusicBrainz_API/Search) — Lucene query syntax for filtering entities.
+
+### 4.2 Build Incremental Ingestion with dlt
+
+**Why watermarks?** A watermark is a bookmark that says "I've ingested everything up to this timestamp." Each run picks up from the last watermark, processes new/updated records, then advances the watermark.
+
+- [ ] Write `scripts/incremental_ingest.py` using dlt:
+  - Query the MusicBrainz API for recently updated entities
+  - Write responses as JSONL to `gs://<PROJECT_ID>-raw/api-incremental/<entity>/<date>/`
+  - Track watermarks (last sync timestamp) via dlt state
+  - Handle pagination, retries, and rate limiting
+  - Disable dlt normalization — raw data lands as-is, dbt owns all transformations
+- [ ] Target entities: artists, release_groups, labels, events
+- [ ] Schedule: daily incremental pulls
+
+> **Why disable dlt normalization?** Keeping all transformation logic in dbt (staging layer) avoids splitting transformation across two tools. dlt handles extraction and loading only.
+>
+> **Why write to GCS before BigQuery?** This is the ELT pattern: raw data always lands in the lake (GCS) first. If a BigQuery load fails, you don't need to re-fetch from the API.
+>
+> **Study**: [dlt normalization docs](https://dlthub.com/docs/general-usage/schema#data-normalizer) — how to configure or disable normalization.
+>
+> **Study**: [ELT vs. ETL](https://www.getdbt.com/analytics-engineering/elt-vs-etl) — why modern pipelines load raw data first and transform inside the warehouse.
+
+### 4.3 Load Incremental Data to BigQuery
+- [ ] Append new records to `raw.<entity>` tables (WRITE_APPEND)
+- [ ] Use a `_load_timestamp` column to track when records were ingested
+- [ ] Deduplication happens in the dbt staging layer (latest record per MBID)
+
+> **Why append instead of upsert at the raw layer?** Keeping raw as append-only preserves history and keeps ingestion simple. All 3 versions of an artist from 3 daily loads are kept in raw. The dbt staging layer deduplicates by taking the latest record per MBID.
+
+### 4.4 Deploy to Cloud Run
+- [ ] Same source-based deployment pattern as Phase 2 (script + `requirements.txt` + `Procfile`)
+- [ ] Deploy as `musicbrainz-incremental` Cloud Run Job
+- [ ] Test with a manual execution before wiring up to Airflow
 
 ---
 
 ## Phase 5: Orchestration with Airflow
 
-**Why Airflow?** Data pipelines have dependencies: you can't transform data that hasn't been ingested yet. Airflow lets you define these dependencies as Directed Acyclic Graphs (DAGs), handles scheduling, retries, alerting, and provides a UI to monitor runs. It's the most widely used orchestrator in data engineering.
+**Why Airflow?** Data pipelines have dependencies: you can't transform data that hasn't been ingested yet. Airflow lets you define these dependencies as Directed Acyclic Graphs (DAGs), handles scheduling, retries, alerting, and provides a UI to monitor runs.
 
-> **Study**: [Airflow core concepts](https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/index.html) — DAGs, tasks, operators, executors, XComs. Read this before writing any DAGs.
+> **Study**: [Airflow core concepts](https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/index.html) — DAGs, tasks, operators, executors, XComs.
 >
-> **Study**: [Airflow best practices](https://airflow.apache.org/docs/apache-airflow/stable/best-practices.html) — common pitfalls like putting heavy logic in DAG files, misusing XComs, and not setting proper retries.
+> **Study**: [Airflow best practices](https://airflow.apache.org/docs/apache-airflow/stable/best-practices.html) — common pitfalls.
 >
-> **Study**: [Astronomer's Airflow guides](https://www.astronomer.io/guides/) — excellent practical tutorials on operators, connections, and patterns.
+> **Study**: [Astronomer's Airflow guides](https://www.astronomer.io/guides/) — practical tutorials on operators, connections, and patterns.
 
-### 5.1 DAG Structure
+### 5.1 Local Airflow with Docker (Development)
+
+**Why start local?** A local Airflow instance in Docker is free and gives you the same DAG authoring experience as production. Once your DAGs are stable, you deploy to a GCE VM.
+
+- [ ] Create `docker-compose.yml` for local Airflow (use the [official Airflow Docker Compose](https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html))
+- [ ] Mount local `dags/` and `scripts/` directories into the container
+- [ ] Configure Airflow to use your GCP service account for BigQuery/GCS access
+- [ ] Verify the Airflow UI is accessible at `localhost:8080`
+
+> **Study**: [Running Airflow in Docker](https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html) — official Docker Compose setup guide.
+
+### 5.2 DAG Structure
 ```
 dags/
   musicbrainz_initial_load.py      # One-time DAG for bulk load
   musicbrainz_daily_incremental.py # Daily: ingest -> load -> transform
-  musicbrainz_dbt_run.py           # Can be standalone or part of daily DAG
 ```
 
-### 5.2 Daily Incremental DAG
+### 5.3 Daily Incremental DAG
 
-**Why this task order?** Each step depends on the previous one completing successfully: you can't load data that hasn't been ingested, and you can't transform data that hasn't been loaded. Airflow enforces this dependency chain — if ingestion fails, it won't attempt the load, preventing cascade failures.
+**Why this task order?** Each step depends on the previous one completing successfully. Airflow enforces this — if ingestion fails, it won't attempt the transform, preventing cascade failures.
 
 - [ ] Task flow:
-  1. `ingest_and_load` — CloudRunExecuteJobOperator: trigger the `musicbrainz-incremental` Cloud Run Job (handles API ingestion, GCS upload, and BigQuery load)
-  2. `dbt_run` — BashOperator: `dbt run --profiles-dir /path --project-dir /path`
-  3. `dbt_test` — BashOperator: `dbt test --profiles-dir /path --project-dir /path`
+  1. `ingest_and_load` — CloudRunExecuteJobOperator: trigger the `musicbrainz-incremental` Cloud Run Job
+  2. `dbt_run` — BashOperator: `dbt run`
+  3. `dbt_test` — BashOperator: `dbt test`
   4. `notify_on_failure` — email or Slack alert on failure
 - [ ] Schedule: `@daily` (or `0 6 * * *` for 6 AM UTC)
 - [ ] Retries: 2, retry delay: 5 minutes
 
-> **Why separate dbt_run and dbt_test?** If tests fail, you want to know about it but you might not want to roll back the models. Separating them lets you see exactly which step failed in the Airflow UI. You could also use `dbt build` which runs both interleaved (test each model right after it's built).
-
-### 5.3 Initial Load DAG
+### 5.4 Initial Load DAG
 - [ ] One-time trigger (manual) DAG for the bulk dump load
 - [ ] Same structure but with WRITE_TRUNCATE and full dbt run
 
-### 5.4 Deploy DAGs (Local Development)
-- [ ] Place DAGs in the `dags/` directory mounted to your Docker Airflow
+### 5.5 Test Locally
+- [ ] Place DAGs in the `dags/` directory mounted to Docker
 - [ ] Test each task individually with `airflow tasks test <dag_id> <task_id> <date>`
-- [ ] Verify full DAG runs in the Airflow UI at `localhost:8080`
+- [ ] Verify full DAG runs in the Airflow UI
 
-### 5.5 Deploy Airflow on GCE VM (Production)
+### 5.6 Provision Airflow VM (Production)
 
-**Why a GCE VM?** Cloud Composer wraps Airflow on GKE and costs ~$300-400/mo minimum — overkill for this project. A single e2-small VM running Airflow with Docker Compose costs ~$15-30/mo if always on. However, for a portfolio project you don't need it running 24/7 — keeping the VM stopped when idle and only starting it for development or pipeline runs brings the cost down to ~$1-2/mo (disk-only charges). This gives you the same real Airflow deployment to showcase, without the always-on bill.
+**Why a GCE VM?** Cloud Composer (managed Airflow on GKE) costs ~$300-400/mo minimum — overkill for this project. A single e2-small VM with Docker Compose costs ~$15-30/mo always-on, or ~$1-2/mo if kept stopped when idle (disk-only charges).
 
 - [ ] Add `airflow_vm.tf` to Terraform:
   - e2-small instance in `us-central1`
   - Attach the pipeline service account
   - Startup script to install Docker and Docker Compose
   - Firewall rule to allow port 8080 (Airflow UI) from your IP only
-- [ ] Create a deployment script to sync DAGs and scripts to the VM (e.g., `gcloud compute scp` or GCS bucket sync)
-- [ ] SSH into the VM and run Airflow via Docker Compose (same `docker-compose.yml` as local dev)
-- [ ] Configure Airflow connections to use the VM's attached service account for GCP auth
-- [ ] Verify the Airflow UI is accessible at `http://<VM_EXTERNAL_IP>:8080`
-- [ ] Set up a basic monitoring alert (VM uptime check) in GCP
-- [ ] Configure VM cost optimization (pick one or both):
-  - **Manual start/stop**: use `gcloud compute instances start/stop` when developing or demoing
-  - **GCE instance schedule**: auto-start/stop the VM during specific hours (e.g., 6-8 AM UTC for daily pipeline runs) — reduces cost from ~$15-30/mo to ~$1-2/mo
+- [ ] `terraform apply` to provision the VM
+- [ ] Create a deployment script to sync DAGs and scripts to the VM
+- [ ] SSH into the VM and run Airflow via Docker Compose
+- [ ] Configure Airflow connections to use the VM's attached service account
+- [ ] Configure VM cost optimization:
+  - **Manual start/stop**: `gcloud compute instances start/stop` for dev/demo
+  - **GCE instance schedule**: auto-start/stop during pipeline windows (e.g., 6-8 AM UTC)
 
-> **Study**: [GCE instance creation with Terraform](https://registry.terraform.io/providers/hashicorp/google/latest/docs/resources/compute_instance) — Terraform resource for managing GCE VMs.
+> **Study**: [GCE instance creation with Terraform](https://registry.terraform.io/providers/hashicorp/google/latest/docs/resources/compute_instance)
 >
-> **Study**: [GCE instance schedules](https://cloud.google.com/compute/docs/instances/schedule-instance-start-stop) — how to auto-start/stop VMs on a schedule to save costs.
+> **Study**: [GCE instance schedules](https://cloud.google.com/compute/docs/instances/schedule-instance-start-stop) — auto-start/stop VMs to save costs.
 >
-> **Security note**: Restrict Airflow UI access via firewall rules (allow only your IP). For extra security, use IAP (Identity-Aware Proxy) to tunnel SSH and web access without exposing ports publicly.
+> **Security note**: Restrict Airflow UI access via firewall rules (allow only your IP). For extra security, consider IAP (Identity-Aware Proxy) to tunnel access without exposing ports publicly.
 
 ---
 
 ## Phase 6: Dashboards with Looker Studio
 
-**Why Looker Studio?** It's free, natively integrates with BigQuery (no connectors needed), and is good enough for most analytics dashboards. For a learning project, it lets you focus on the data platform rather than self-hosting a BI tool.
+**Why Looker Studio?** It's free, natively integrates with BigQuery, and is good enough for most analytics dashboards. For a learning project, it lets you focus on the data platform rather than self-hosting a BI tool.
 
-> **Study**: [Looker Studio tutorial](https://support.google.com/looker-studio/answer/9171315) — official getting started guide.
+> **Study**: [Looker Studio tutorial](https://support.google.com/looker-studio/answer/9171315) — getting started guide.
 >
 > **Study**: [Connecting BigQuery to Looker Studio](https://support.google.com/looker-studio/answer/6370296)
 >
-> **Study**: [Dashboard design principles](https://www.storytellingwithdata.com/) — "Storytelling with Data" by Cole Nussbaumer Knaflic. The book is worth reading; the blog has free content on effective data visualization.
+> **Study**: [Dashboard design principles](https://www.storytellingwithdata.com/) — "Storytelling with Data" by Cole Nussbaumer Knaflic.
 
 ### 6.1 Connect Looker Studio to BigQuery
 - [ ] Go to https://lookerstudio.google.com
@@ -578,131 +559,110 @@ dags/
 
 ## Phase 7: CI/CD with GitHub Actions
 
-**Why CI/CD?** Continuous Integration / Continuous Deployment automates testing and deployment. When you push code, CI runs linting and tests; when you merge to main, CD deploys changes. This catches bugs before they reach production and eliminates manual deployment steps.
+**Why CI/CD?** Continuous Integration / Continuous Deployment automates testing and deployment. When you push code, CI runs linting and tests; when you merge to main, CD deploys changes.
 
-> **Study**: [GitHub Actions quickstart](https://docs.github.com/en/actions/quickstart) — understand workflows, jobs, steps, and triggers.
+> **Study**: [GitHub Actions quickstart](https://docs.github.com/en/actions/quickstart) — workflows, jobs, steps, and triggers.
 >
 > **Study**: [Terraform CI/CD with GitHub Actions](https://developer.hashicorp.com/terraform/tutorials/automation/github-actions) — official HashiCorp tutorial.
 >
-> **Study**: [dbt CI/CD](https://docs.getdbt.com/docs/deploy/continuous-integration) — how to run dbt in CI against a dev/PR-specific dataset.
+> **Study**: [dbt CI/CD](https://docs.getdbt.com/docs/deploy/continuous-integration) — running dbt in CI against a dev dataset.
 
-### 7.1 Repository Structure
-```
-.github/
-  workflows/
-    terraform.yml        # Plan on PR, apply on merge to main
-    dbt.yml              # dbt build + test on PR (against a dev dataset)
-    lint.yml             # Python linting, SQL linting (sqlfluff)
-terraform/
-dbt/
-dags/
-scripts/
-tests/
-CLAUDE.md
-README.md
-```
+### 7.1 Workload Identity Federation
+
+**Why WIF?** In CI/CD, GitHub Actions needs to authenticate to GCP. Workload Identity Federation lets GitHub Actions impersonate the Terraform SA with short-lived tokens — no long-lived JSON key files to store as secrets.
+
+- [ ] Configure the trust relationship between GCP and GitHub
+- [ ] Set up the GitHub Actions workflow to authenticate via WIF
+
+> **Study**: [Workload Identity Federation](https://cloud.google.com/iam/docs/workload-identity-federation) — how external workloads authenticate to GCP without key files.
 
 ### 7.2 Terraform CI/CD
 
-**Why plan on PR, apply on merge?** Running `terraform plan` on a PR lets reviewers see exactly what infrastructure will change before approving. Applying only on merge to main ensures only reviewed changes reach production. This is the standard GitOps workflow for IaC.
+**Why plan on PR, apply on merge?** Running `terraform plan` on a PR lets reviewers see exactly what will change. Applying only on merge ensures only reviewed changes reach production.
 
 - [ ] On PR: `terraform fmt -check`, `terraform validate`, `terraform plan`
 - [ ] On merge to main: `terraform apply -auto-approve`
-- [ ] Configure Workload Identity Federation for keyless GCP auth from GitHub Actions (deferred from Phase 0.5 — set up the trust relationship between GCP and GitHub, so workflows can impersonate the Terraform SA)
 - [ ] Store project config in GitHub Secrets / Variables
 
 ### 7.3 dbt CI/CD
 - [ ] On PR: `dbt build --target dev` (runs models + tests against a dev dataset)
 - [ ] On merge to main: optionally trigger a production dbt run
-- [ ] Lint SQL with `sqlfluff` (configure for BigQuery dialect)
+- [ ] Lint SQL with `sqlfluff` (BigQuery dialect)
 
-> **Study**: [sqlfluff](https://docs.sqlfluff.com/en/stable/) — SQL linter and formatter. Configure it for BigQuery dialect to catch syntax issues before they hit production.
+> **Study**: [sqlfluff](https://docs.sqlfluff.com/en/stable/) — SQL linter and formatter.
 
 ### 7.4 Python CI/CD
-- [ ] Lint with `ruff` or `flake8`
-- [ ] Type check with `mypy` (optional)
+- [ ] Lint with `ruff`
 - [ ] Unit tests with `pytest` for ingestion scripts
 
 ---
 
 ## Phase 8: Monitoring, Cost Control & Hardening
 
-**Why monitoring?** Pipelines fail silently — an API endpoint changes, a schema drifts, a BigQuery job times out. Without monitoring, you might not notice for days that your dashboard is showing stale data. Monitoring closes this loop.
+**Why monitoring?** Pipelines fail silently — an API endpoint changes, a schema drifts, a BigQuery job times out. Without monitoring, you might not notice for days that your dashboard is showing stale data.
 
-> **Study**: [GCP Cloud Monitoring](https://cloud.google.com/monitoring/docs/monitoring-overview) — metrics, alerts, and dashboards for GCP services.
+> **Study**: [GCP Cloud Monitoring](https://cloud.google.com/monitoring/docs/monitoring-overview) — metrics, alerts, and dashboards.
 >
-> **Study**: [BigQuery admin reference guide](https://cloud.google.com/bigquery/docs/best-practices-costs) — cost optimization, slot management, and query performance.
+> **Study**: [BigQuery cost best practices](https://cloud.google.com/bigquery/docs/best-practices-costs) — cost optimization and query performance.
 
 ### 8.1 Cost Management
 - [ ] Set up billing budget alerts at $25, $50, $75
 - [ ] Use BigQuery on-demand pricing (first 1 TB/mo queries free)
 - [ ] Set BigQuery per-user query quotas to prevent runaway costs
 - [ ] Use GCS lifecycle rules to move old raw data to Nearline/Coldline
-- [ ] Review the [GCP Pricing Calculator](https://cloud.google.com/products/calculator) to estimate monthly costs
+- [ ] Review the [GCP Pricing Calculator](https://cloud.google.com/products/calculator)
 
 ### 8.2 Monitoring
 - [ ] Set up Airflow email alerts on DAG failures
 - [ ] Create a dbt freshness check (`dbt source freshness`) in the daily DAG
-- [ ] Monitor BigQuery slot usage and query costs in the console
+- [ ] Monitor BigQuery slot usage and query costs
 
 ### 8.3 Security
 - [ ] Use Secret Manager for any API keys or credentials
 - [ ] Principle of least privilege on all service accounts
 - [ ] Enable audit logging on the GCP project
 
-> **Study**: [GCP security best practices](https://cloud.google.com/docs/enterprise/best-practices-for-enterprise-organizations#securing-your-environment) — overview of securing a GCP environment.
+> **Study**: [GCP security best practices](https://cloud.google.com/docs/enterprise/best-practices-for-enterprise-organizations#securing-your-environment)
 
 ---
 
 ## Execution Order Summary
 
-| Order | Phase | Estimated Effort | Depends On |
-|-------|-------|-----------------|------------|
-| 1 | Phase 0: GCP Account & Tooling | 1-2 hours | Nothing |
-| 2 | Phase 1: Terraform Infrastructure | 4-8 hours | Phase 0 |
-| 3 | Phase 2: Bulk Data Ingestion | 4-6 hours | Phase 1 |
-| 4 | Phase 4.1-4.2: dbt Setup + Staging | 4-6 hours | Phase 2 |
-| 5 | Phase 4.3-4.6: dbt Curated + Analytics | 6-10 hours | Phase 4.2 |
-| 6 | Phase 3: Incremental Ingestion | 4-6 hours | Phase 2 |
-| 7 | Phase 5: Airflow DAGs | 4-8 hours | Phase 3, 4 |
-| 8 | Phase 6: Looker Studio Dashboards | 3-5 hours | Phase 4.4 |
-| 9 | Phase 7: CI/CD | 3-5 hours | Phase 1, 4 |
-| 10 | Phase 8: Monitoring & Hardening | 2-4 hours | All above |
+| Order | Phase | Depends On |
+|-------|-------|------------|
+| 1 | Phase 0: Bootstrap | Nothing |
+| 2 | Phase 1: Terraform Infrastructure | Phase 0 |
+| 3 | Phase 2: Bulk Data Ingestion | Phase 1 |
+| 4 | Phase 3.1-3.3: dbt Setup + Staging + Seeds | Phase 2 |
+| 5 | Phase 3.4-3.6: dbt Curated + Analytics + Tests | Phase 3.3 |
+| 6 | Phase 4: Incremental API Ingestion | Phase 2 |
+| 7 | Phase 5: Airflow Orchestration | Phase 3, 4 |
+| 8 | Phase 6: Looker Studio Dashboards | Phase 3.5 |
+| 9 | Phase 7: CI/CD | Phase 1, 3 |
+| 10 | Phase 8: Monitoring & Hardening | All above |
 
 ---
 
 ## Recommended Learning Path
 
-Before diving into implementation, consider studying these topics in order. You don't need to finish everything before starting — but having the mental model helps you understand *why* you're doing each step.
+Before diving into implementation, study these topics in order. You don't need to finish everything before starting — but having the mental model helps.
 
-### Foundations (read/watch before Phase 0)
+### Foundations (before Phase 0)
 1. [GCP Resource Hierarchy](https://cloud.google.com/resource-manager/docs/cloud-platform-resource-hierarchy) — projects, IAM, billing
 2. [GCP IAM overview](https://cloud.google.com/iam/docs/overview) — how permissions work
-3. [Terraform GCP tutorial](https://developer.hashicorp.com/terraform/tutorials/gcp-get-started) — hands-on, ~2 hours
+3. [Terraform GCP tutorial](https://developer.hashicorp.com/terraform/tutorials/gcp-get-started) — hands-on
 
-### Data Engineering Concepts (read before Phase 2)
-4. [Medallion architecture (raw/curated/analytics)](https://www.databricks.com/glossary/medallion-architecture) — the layered data pattern
+### Data Engineering Concepts (before Phase 2)
+4. [Medallion architecture](https://www.databricks.com/glossary/medallion-architecture) — the layered data pattern
 5. [ELT vs. ETL](https://www.getdbt.com/analytics-engineering/elt-vs-etl) — why we load first, transform second
 6. [Kimball dimensional modeling](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/) — star schemas, facts, and dimensions
 
-### Tool-Specific (read when you reach the relevant phase)
+### Tool-Specific (when you reach the relevant phase)
 7. [dbt Fundamentals free course](https://courses.getdbt.com/courses/fundamentals) — 4-5 hours, covers everything you need
 8. [Airflow core concepts](https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/index.html) — DAGs, operators, scheduling
 9. [BigQuery best practices](https://cloud.google.com/bigquery/docs/best-practices-performance-overview) — partitioning, clustering, query optimization
 
 ### Books (optional deep dives)
-10. *Fundamentals of Data Engineering* by Joe Reis & Matt Housley — the most comprehensive modern DE book, covers the full lifecycle
+10. *Fundamentals of Data Engineering* by Joe Reis & Matt Housley — comprehensive modern DE book
 11. *The Data Warehouse Toolkit* by Ralph Kimball — the bible for dimensional modeling
-12. *Storytelling with Data* by Cole Nussbaumer Knaflic — for making your dashboards actually useful
-
----
-
-## Key Decisions & Notes
-
-- **Region**: `us-central1` — cheapest for most GCP services, free BigQuery data transfer within US multi-region.
-- **Local Airflow for dev, GCE VM for prod**: Develop and test DAGs locally with Docker Compose. Deploy to a GCE e2-small VM (~$15-30/mo) for production scheduling — much cheaper than Cloud Composer (~$300-400/mo).
-- **Two ingestion approaches, both on Cloud Run**: The initial bulk load uses simple Python scripts (`google-cloud-storage` + `google-cloud-bigquery`) — no dlt, since it's a one-time operation. The daily incremental API loads use dlt — its pagination, rate limiting, and watermark tracking add real value for recurring pipelines. Both run as Cloud Run Jobs (up to 32 GiB RAM, pay-per-use) for fast network, no local resource constraints, and consistent deployment. Airflow only orchestrates — it triggers Cloud Run jobs and monitors their status. Deployed via source-based deployment (`gcloud run jobs deploy --source`) — no manual Dockerfile, image build, or Artifact Registry management needed.
-- **Cloud Run managed via `gcloud`**: Source-based deployment creates the job and builds the container image in one step. `gcloud run jobs deploy` is an upsert (creates or updates), making it ideal for iterative deployment.
-- **MusicBrainz API rate limit**: 1 req/sec. For large incremental catches, consider using the database dumps instead of the API.
-- **Genre identification**: MusicBrainz uses a tag system, not a strict genre hierarchy. You'll need a `genre_mapping` seed to categorize tags like "hard rock", "punk rock", "progressive rock" under "Rock".
-- **Incremental strategy**: Use `_load_timestamp` watermarks + dbt incremental models with deduplication on MusicBrainz entity IDs (MBIDs).
+12. *Storytelling with Data* by Cole Nussbaumer Knaflic — making dashboards useful

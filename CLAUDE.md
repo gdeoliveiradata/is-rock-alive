@@ -13,7 +13,7 @@ MusicBrainz Dump (tar.xz/JSONL) --> [Python scripts on Cloud Run Job] --> GCS Ra
 MusicBrainz API (daily incremental) --> [dlt on Cloud Run Job] --> GCS Raw Bucket --> BigQuery (raw)
 BigQuery (raw) --> dbt staging --> dbt curated --> dbt analytics --> Looker Studio
 Orchestration: Airflow on GCE VM (e2-small, scheduling only)
-Ingestion compute: Cloud Run Jobs (source-based deployment, up to 32 GB RAM, pay-per-use)
+Ingestion compute: Cloud Run Jobs (source-based deployment via gcloud, up to 32 GiB RAM, pay-per-use)
 Infrastructure: Terraform
 CI/CD: GitHub Actions
 ```
@@ -32,7 +32,7 @@ CI/CD: GitHub Actions
 ## Project Structure
 
 ```
-terraform/          # All GCP infrastructure
+terraform/          # GCP infrastructure (GCS, BigQuery, IAM, Airflow VM)
 dbt/                # dbt project (models, tests, seeds, macros)
 dags/               # Airflow DAGs (local Docker + GCE VM)
 scripts/            # Python ingestion scripts (upload, bulk load, incremental)
@@ -91,7 +91,8 @@ pytest tests/
 
 - **No JSON key files**: SA key creation is disabled by org policy (`constraints/iam.disableServiceAccountKeyCreation`). Locally, Terraform and other tools authenticate via Application Default Credentials (`gcloud auth application-default login`). In CI/CD, GitHub Actions uses Workload Identity Federation to impersonate the Terraform SA with short-lived tokens.
 - **Local Airflow for dev, GCE VM for prod**: Docker Compose for development; GCE e2-small VM for production scheduling (scheduling only — no heavy compute). VM kept stopped when idle to save costs (~$1-2/mo disk-only vs. ~$15-30/mo always-on); started manually (`gcloud compute instances start`) or via GCE instance schedule for pipeline windows
-- **Two ingestion approaches, both on Cloud Run**: Initial bulk load uses simple Python scripts (`google-cloud-storage` + `google-cloud-bigquery`) — no dlt, since it's a one-time operation. Daily incremental API loads use dlt. Both run as Cloud Run Jobs (up to 32 GB RAM, pay-per-use) for fast network and consistent deployment. Airflow triggers Cloud Run jobs via `CloudRunExecuteJobOperator`. Deployed via source-based deployment (`gcloud run deploy --source`) — Cloud Run builds the container automatically using Google Cloud Buildpacks and stores the image in an auto-managed Artifact Registry repository (`cloud-run-source-deploy`). No manual Dockerfile, image build, or registry management needed.
+- **Two ingestion approaches, both on Cloud Run**: Initial bulk load uses simple Python scripts (`google-cloud-storage` + `google-cloud-bigquery`) — no dlt, since it's a one-time operation. Daily incremental API loads use dlt. Both run as Cloud Run Jobs (up to 32 GiB RAM, pay-per-use) for fast network and consistent deployment. Airflow triggers Cloud Run jobs via `CloudRunExecuteJobOperator`. Deployed via source-based deployment (`gcloud run jobs deploy --source`) — Cloud Run builds the container automatically using Google Cloud Buildpacks and stores the image in an auto-managed Artifact Registry repository (`cloud-run-source-deploy`). No manual Dockerfile, image build, or registry management needed.
+- **Cloud Run managed via `gcloud`**: Source-based deployment creates the job and builds the container image in one step. `gcloud run jobs deploy` is an upsert (creates or updates), making it ideal for iterative deployment.
 - **Append-only raw layer**: raw tables use WRITE_APPEND, deduplication on MBIDs happens in dbt staging
 - **Watermark-based incrementals**: track last sync timestamp per entity, API pulls only new/updated records
 - **Genre via tags**: MusicBrainz has no genre field — genres come from the tag system. A `genre_mapping` dbt seed maps raw tags (e.g., "hard rock", "classic rock") to standardized categories

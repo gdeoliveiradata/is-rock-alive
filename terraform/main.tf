@@ -1,3 +1,5 @@
+# Remote backend in GCS so state is shared, versioned, and supports locking.
+# The backend block only accepts literals — no variables or expressions.
 terraform {
   required_providers {
     google = {
@@ -11,6 +13,7 @@ terraform {
   }
 }
 
+# Authenticates via Application Default Credentials (no JSON key files).
 provider "google" {
   project = var.PROJECT_ID
   region  = var.PROJECT_REGION

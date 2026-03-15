@@ -81,7 +81,7 @@ pytest tests/
 - **Append-only raw layer**: Raw tables use WRITE_APPEND, deduplication on MBIDs happens in dbt staging.
 - **JSONL for raw layer**: Matches the source format, schema-on-read avoids Parquet merge issues, BigQuery loads JSONL natively for free.
 - **Genre via tags**: MusicBrainz has no genre field — genres come from the tag system. A `genre_mapping` dbt seed maps raw tags to standardized categories.
-- **Region**: `us-central1` for compute; BigQuery dataset in `US` multi-region for free GCS transfer.
+- **Region**: `us-central1` for both compute and BigQuery datasets (same region as GCS buckets, free data transfer).
 
 ## MusicBrainz API Notes
 

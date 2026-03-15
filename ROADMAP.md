@@ -113,11 +113,11 @@ terraform/
 
 **Why a remote backend?** Terraform tracks what it has created in a *state file*. By default this is local (`terraform.tfstate`), but storing it in GCS means it's shared, versioned, and not lost if your machine dies. It also enables state locking to prevent concurrent modifications.
 
-- [ ] Create a GCS bucket manually for Terraform state: `gs://<PROJECT_ID>-tf-state`
-- [ ] Configure remote backend in `main.tf`
-- [ ] Configure the `google` provider with project, region, zone using input variables
-- [ ] Create `variables.tf` (declarations) and `terraform.tfvars` (values, gitignored)
-- [ ] Run `terraform init` successfully
+- [x] Create a GCS bucket manually for Terraform state: `gs://<PROJECT_ID>-tf-state`
+- [x] Configure remote backend in `main.tf`
+- [x] Configure the `google` provider with project, region, zone using input variables
+- [x] Create `variables.tf` (declarations) and `terraform.tfvars` (values, gitignored)
+- [x] Run `terraform init` successfully
 
 > **Important**: The `backend` block does not support variables or expressions — only literal values. This is because Terraform evaluates the backend *before* processing the rest of the configuration. The bucket name must be hardcoded in `main.tf`.
 >
@@ -127,11 +127,11 @@ terraform/
 
 **Why GCS as the raw layer?** Cloud object storage is the standard landing zone for data lakes: it's cheap ($0.02/GB/mo for Standard), infinitely scalable, supports any file format, and integrates natively with BigQuery for loading. Raw data lives here so you always have an immutable copy of what was ingested — if your transformations have bugs, you can reprocess from raw.
 
-- [ ] **Raw bucket**: `gs://<PROJECT_ID>-raw` — landing zone for JSONL dumps and API responses
+- [x] **Raw bucket**: `gs://<PROJECT_ID>-raw` — landing zone for JSONL dumps and API responses
   - Lifecycle rule: transition to Nearline after 90 days
-- [ ] **Staging bucket**: `gs://<PROJECT_ID>-staging` — temporary processing area
-- [ ] **Airflow bucket**: `gs://<PROJECT_ID>-airflow` — for syncing DAGs and scripts to the GCE VM
-- [ ] All buckets use `uniform_bucket_level_access = true` (IAM-only, no legacy ACLs)
+- [x] **Staging bucket**: `gs://<PROJECT_ID>-staging` — temporary processing area
+- [x] **Airflow bucket**: `gs://<PROJECT_ID>-airflow` — for syncing DAGs and scripts to the GCE VM
+- [x] All buckets use `uniform_bucket_level_access = true` (IAM-only, no legacy ACLs)
 
 > **Why lifecycle rules?** Old raw data is rarely re-read. Moving it automatically to cheaper storage classes (Nearline: $0.01/GB/mo) saves money without deleting anything.
 >
@@ -147,11 +147,11 @@ terraform/
 
 **Why multiple datasets?** Datasets in BigQuery are like schemas in PostgreSQL — they're organizational units with independent access controls. Separating raw/staging/curated/analytics lets you grant different permissions (e.g., Looker Studio only reads `analytics`) and makes the data lineage visible.
 
-- [ ] `raw` dataset — loaded data from GCS JSONL files
-- [ ] `staging` dataset — intermediate dbt models (views)
-- [ ] `curated` dataset — cleaned, deduplicated, typed tables (dbt models)
-- [ ] `analytics` dataset — final aggregated tables for Looker Studio
-- [ ] Set dataset location to `US` (multi-region, for free data transfer from `us-central1` GCS buckets)
+- [x] `raw` dataset — loaded data from GCS JSONL files
+- [x] `staging` dataset — intermediate dbt models (views)
+- [x] `curated` dataset — cleaned, deduplicated, typed tables (dbt models)
+- [x] `analytics` dataset — final aggregated tables for Looker Studio
+- [x] Set dataset location to `us-central1` (same region as GCS buckets, free data transfer)
 
 > **Why does location matter?** BigQuery charges for cross-region data transfer. If your GCS bucket is in `us-central1` and your BigQuery dataset is in `US` multi-region, the transfer is free. Mixing regions (e.g., EU dataset with US bucket) incurs egress costs.
 >
@@ -165,8 +165,8 @@ terraform/
 
 **Why a separate pipeline SA?** The pipeline SA is used by Airflow, dbt, Cloud Run Jobs, and any runtime workload. It gets only the permissions these workloads need — not the broad `roles/editor` that the Terraform SA has. This follows the principle of least privilege.
 
-- [ ] Create the pipeline service account (`pipeline-sa`) via Terraform
-- [ ] Bind the following roles to the pipeline SA using additive IAM resources:
+- [x] Create the pipeline service account (`pipeline-sa`) via Terraform
+- [x] Bind the following roles to the pipeline SA using additive IAM resources:
   - `roles/bigquery.dataEditor` — read/write BigQuery tables
   - `roles/bigquery.jobUser` — run BigQuery queries
   - `roles/storage.objectAdmin` — read/write GCS objects
@@ -189,16 +189,16 @@ terraform/
 
 ### 1.6 Outputs
 
-- [ ] Create `outputs.tf` with useful values: bucket names, dataset IDs, pipeline SA email
-- [ ] These outputs can be referenced by scripts and CI/CD pipelines
+- [x] Create `outputs.tf` with useful values: bucket names, dataset IDs, pipeline SA email
+- [x] These outputs can be referenced by scripts and CI/CD pipelines
 
 > **Study**: [Terraform outputs](https://developer.hashicorp.com/terraform/language/values/outputs)
 
 ### 1.7 Apply and Verify
 
-- [ ] Run `terraform plan` — review every resource that will be created
-- [ ] Run `terraform apply` — provision all resources
-- [ ] Verify in the GCP Console: buckets, datasets, SA, and role bindings exist
+- [x] Run `terraform plan` — review every resource that will be created
+- [x] Run `terraform apply` — provision all resources
+- [x] Verify in the GCP Console: buckets, datasets, SA, and role bindings exist
 
 > **Study**: [Terraform plan/apply workflow](https://developer.hashicorp.com/terraform/cli/run) — always `plan` before `apply` to see what will change. Treat `plan` output like a code diff.
 
@@ -216,7 +216,22 @@ terraform/
 >
 > **Study**: [MusicBrainz schema diagram](https://musicbrainz.org/doc/MusicBrainz_Database/Schema) — entity relationships. Critical for understanding how artists, releases, labels, and tags connect.
 
+**Learning sequence summary:**
+
+| Order | Step | Why first |
+|-------|------|-----------|
+| 1 | Explore the source data | Can't write a loader without knowing the format |
+| 2 | Understand BigQuery JSON loading | Loading behavior drives chunking and schema decisions |
+| 3 | Design the script architecture | Think before coding — parameterization, streaming, chunking |
+| 4 | Implement and test with event (small entity) | Small entity = fast feedback loops, script already parameterized |
+| 5 | Test with large entities (artist) | Validates streaming approach under real load |
+| 6 | Package for Cloud Run | One job, per-entity executions via env var overrides |
+| 7 | Deploy, execute, and validate | End-to-end verification, one execution per entity |
+
 ### 2.1 Explore MusicBrainz Data Dump
+
+Before writing any code, you need to know exactly what you're ingesting. Download a small sample and study it.
+
 - [ ] Explore the dump index at https://data.metabrainz.org/pub/musicbrainz/data/json-dumps/
   - `artist.tar.xz` (~2 GB compressed) — name, type, area, begin/end dates, disambiguation, relations, genres, tags
   - `release-group.tar.xz` (~1 GB compressed) — title, type (album/single/EP), artist credit, first release date
@@ -227,46 +242,152 @@ terraform/
 - [ ] Inspect a few lines to understand the nested structure (relations, genres, tags, aliases, area, life-span are all embedded)
 - [ ] Note: genres/tags are embedded inside artist and release-group records — there's no separate genre dump. The dbt staging layer will extract these into dedicated models.
 
-> **Why JSONL?** JSON Lines (one JSON object per line) is ideal for big data pipelines: it's streamable, splittable, and directly supported by BigQuery load jobs.
+> **Concept — tar.xz**: A tar archive compressed with LZMA2 (xz). The tar groups files into one archive, xz compresses it. Python's `tarfile` module can open these directly without manually decompressing first.
+>
+> **Concept — JSONL (JSON Lines)**: One self-contained JSON object per line. Unlike a JSON array, you can process it line-by-line without loading the whole file into memory. This is what makes it streamable.
+>
+> **Why JSONL?** JSON Lines is ideal for big data pipelines: it's streamable, splittable, and directly supported by BigQuery load jobs.
 >
 > **Data sizes**: The target entities total ~3.4 GB compressed. The deeply nested JSON (especially artist relations) expands significantly when decompressed — the script handles this via stream extraction, avoiding full decompression to disk.
+>
+> **Study**: [Python `tarfile` module](https://docs.python.org/3/library/tarfile.html) — focus on `tarfile.open()` with mode `r:xz` and iterating members.
+>
+> **Study**: [JSON Lines format](https://jsonlines.org/) — the spec is tiny, worth reading entirely.
 
-### 2.2 Write the Bulk Load Script
-- [ ] Write a Python script (`scripts/bulk_load.py`) that handles the full pipeline:
-  1. **Download**: Stream the tar.xz directly from MusicBrainz
-  2. **Extract**: Stream-extract the JSONL using Python's `tarfile` module (avoid decompressing fully to disk)
-  3. **Upload**: Upload JSONL chunks (~100 MB each) to `gs://<PROJECT_ID>-raw/musicbrainz-dump/<entity>/`
-  4. **Load**: Create BigQuery load jobs from the GCS chunks into `raw.<entity>` tables
-  5. **Validate**: Compare row counts against MusicBrainz published statistics
+### 2.2 Understand BigQuery JSON Loading
+
+Before writing the upload/load logic, you need to understand how BigQuery handles JSONL, because it affects decisions you'll make in the script.
+
+- [ ] How does BigQuery infer schema from JSONL? What happens with nested objects and arrays — does it create `STRUCT` and `ARRAY` types automatically?
+- [ ] What's the difference between autodetect schema vs. providing an explicit schema?
+- [ ] What's the `source_format` parameter for JSONL loads?
+- [ ] What are the limits? (max file size per load job, max row size, max nested depth)
+- [ ] What's the difference between `WRITE_TRUNCATE` and `WRITE_APPEND` disposition, and which makes sense for a one-time initial load?
+
+> **Concept — Schema autodetect**: BigQuery scans a sample of rows to infer types. For JSONL with consistent structure this works well, but mixed types in the same field can cause failures. The MusicBrainz dumps have consistent schemas per entity, so autodetect is a reasonable choice.
+>
+> **Concept — Load jobs vs. streaming inserts**: Load jobs are free, batch-oriented, and support GCS URIs. Streaming inserts cost money and are for real-time. You want load jobs.
+>
+> **Concept — Source URI wildcards**: A single load job can ingest multiple GCS files using a wildcard pattern like `gs://bucket/path/*.jsonl`. This is why chunking works — you upload N chunks, then load them all in one job.
+>
+> **Study**: [Loading JSON data into BigQuery](https://cloud.google.com/bigquery/docs/loading-data-cloud-storage-json) — the primary reference for this step.
+>
+> **Study**: [BigQuery load job quotas and limits](https://cloud.google.com/bigquery/quotas#load_jobs) — max file sizes, row sizes, and daily limits.
+>
+> **Study**: [Schema autodetection](https://cloud.google.com/bigquery/docs/schema-detect) — how it works and when it breaks.
+>
+> **Study**: [BigQuery Python client — `LoadJobConfig`](https://cloud.google.com/python/docs/reference/bigquery/latest/google.cloud.bigquery.job.LoadJobConfig) — the config object you'll use.
+
+### 2.3 Design the Script Architecture
+
+Before coding, think through the script's flow and decide on a structure.
+
+**Key design decision — one script, one job, per-entity executions**: Instead of writing a separate script per entity or a single script that loops through all entities, the script processes *one entity per run*, receiving the entity name as an environment variable (`ENTITY`). This gives you:
+- **Failure isolation**: if `artist` fails, `event` is unaffected — you retry only the failed entity
+- **Independent retries**: re-run any entity without touching the others
+- **No code duplication**: one codebase handles all entities identically
+- **Airflow-friendly**: in Phase 5, each entity becomes its own DAG task with independent retries, timeouts, and monitoring
+
+Since all four entities follow the same structure (tar.xz containing `mbdump/<entity>` with JSONL inside), the entity name is the only parameter needed — the download URL, GCS path, BigQuery table name, and tar member path can all be derived from it.
+
+The pipeline per entity is:
+
+```
+Download (HTTP stream) → Extract (tar.xz stream) → Chunk (split JSONL) → Upload (GCS) → Load (BigQuery) → Validate
+```
+
+- [ ] The script reads the `ENTITY` environment variable (e.g., `artist`, `release-group`, `label`, `event`) and derives all paths from it
+- [ ] Should you download to disk first, or stream directly from HTTP into the tar extractor? Think about memory and disk tradeoffs — Cloud Run Jobs have limited ephemeral disk
+- [ ] How big should each chunk be? (~100 MB is a sweet spot — why?)
+- [ ] How do you count lines while chunking, so you can validate later?
+- [ ] How should you structure the GCS paths? (e.g., `gs://<PROJECT_ID>-raw/musicbrainz-dump/<entity>/`)
+- [ ] What happens if the script fails halfway — how do you make it re-runnable?
+
+> **Concept — Parameterized jobs**: A single Cloud Run Job can serve multiple purposes by accepting configuration through environment variables. You deploy once, then execute multiple times with different parameters. This is a common pattern — think of it like a function that takes arguments, not a hardcoded script.
+>
+> **Concept — Stream processing**: The key insight of this script. Instead of download → save → open → read → upload as separate steps, you chain them: the HTTP response body feeds into `tarfile`, which feeds lines into a chunking buffer, which feeds into GCS uploads. This keeps memory usage constant regardless of file size.
+>
+> **Concept — Chunking**: Splitting a large file into smaller pieces. Each chunk is a valid JSONL file (complete lines only). Benefits: parallelism in BigQuery loads, natural restart boundaries, fits within upload size limits.
+>
+> **Concept — Idempotency**: If you run the script twice, do you get duplicate data? Using `WRITE_TRUNCATE` for the initial load makes the BigQuery side idempotent. For GCS, uploading to the same paths overwrites existing chunks.
+>
+> **Study**: [Python `requests` library — streaming](https://docs.python-requests.readthedocs.io/en/latest/user/advanced/#streaming-requests) — `stream=True` and iterating over response content.
+>
+> **Study**: [GCS Python client — `Blob.upload_from_file()`](https://cloud.google.com/python/docs/reference/storage/latest/google.cloud.storage.blob.Blob#google_cloud_storage_blob_Blob_upload_from_file) — uploading from a file-like object.
+>
+> **Study**: [Cloud Run Jobs — filesystem](https://cloud.google.com/run/docs/container-contract#filesystem) — understand the in-memory filesystem and its limits.
+
+### 2.4 Implement and Test with Event (Small Entity)
+
+Start with `event.tar.xz` (~42 MB compressed, smallest entity). Get the full pipeline working end-to-end before tackling artist (~2 GB). The script should already be parameterized by entity — you're just testing it with `ENTITY=event` first.
+
+- [ ] Write a Python script (`scripts/bulk_load.py`) that reads the `ENTITY` env var and derives all config from it (URL, GCS path, BQ table, tar member)
+- [ ] **Step A — Download + Extract**: Get lines out of the tar.xz (test with the local file first, then with HTTP streaming)
+- [ ] **Step B — Chunk + Upload to GCS**: Split into JSONL chunks and upload to `gs://<PROJECT_ID>-raw/musicbrainz-dump/event/`
+- [ ] **Step C — Load to BigQuery**: Create a load job from the GCS URI pattern into `raw.event`
+- [ ] **Step D — Validate**: Compare row counts (lines uploaded vs. rows in BigQuery)
 - [ ] Use `google-cloud-storage` and `google-cloud-bigquery` Python client libraries
 - [ ] Log progress (entity, chunk count, bytes uploaded, rows loaded, elapsed time)
 - [ ] Write disposition: WRITE_TRUNCATE (full replace for initial load)
-- [ ] Target entities: artist, release-group, label, event
+- [ ] Verify at each step: after extract (can you read and count lines?), after upload (chunks in GCS with expected sizes?), after load (table exists with right schema and row count?)
 
-> **Why stream-extract?** The artist dump alone is ~2 GB compressed and could expand to 15-20 GB. Streaming through `tarfile` avoids needing that disk space — you read the compressed archive and upload chunks directly to GCS.
+> **Concept — `io.BytesIO` / `io.StringIO`**: In-memory file-like objects. Useful as buffers when you need a "file" to pass to an upload function but don't want to write to disk.
 >
-> **Why chunk large files?** BigQuery load jobs perform better with files in the 100 MB–1 GB range. Too many tiny files = overhead; one huge file = no parallelism. Chunking also gives natural restart points if an upload fails.
+> **Concept — Context managers**: `tarfile.open()` and GCS clients should be used with `with` statements to ensure cleanup.
 >
-> **Study**: [Python tarfile module](https://docs.python.org/3/library/tarfile.html) — streaming mode for tar archives.
+> **Concept — BigQuery load job polling**: `load_table_from_uri()` returns a job object. You need to call `.result()` to wait for completion and check for errors.
 >
-> **Study**: [google-cloud-storage Python client](https://cloud.google.com/storage/docs/reference/libraries#client-libraries-install-python) — `Blob.upload_from_file()` for streaming uploads.
+> **Study**: [Python `io` module](https://docs.python.org/3/library/io.html) — `BytesIO` and `StringIO`.
 >
-> **Study**: [Loading JSON data into BigQuery](https://cloud.google.com/bigquery/docs/loading-data-cloud-storage-json)
+> **Study**: [google-cloud-storage quickstart](https://cloud.google.com/storage/docs/reference/libraries#client-libraries-install-python) — installation and basic usage.
 >
-> **Study**: [BigQuery Python client](https://cloud.google.com/bigquery/docs/reference/libraries#client-libraries-install-python) — `LoadJobConfig` and `load_table_from_uri`.
+> **Study**: [google-cloud-bigquery quickstart](https://cloud.google.com/bigquery/docs/reference/libraries#client-libraries-install-python) — installation and basic usage.
+>
+> **Study**: [BigQuery `load_table_from_uri`](https://cloud.google.com/python/docs/reference/bigquery/latest/google.cloud.bigquery.client.Client#google_cloud_bigquery_client_Client_load_table_from_uri) — the method you'll call.
 
-### 2.3 Deploy and Execute on Cloud Run
+### 2.5 Test with Large Entities
+
+Once event works, run the same script with the larger entities. Since the script is already parameterized, this is about validating that your streaming and chunking approach holds up under real load — not about changing code.
+
+- [ ] Run with `ENTITY=label` (~161 MB) — intermediate size, quick validation
+- [ ] Run with `ENTITY=release-group` (~1 GB) — tests chunking more thoroughly
+- [ ] Run with `ENTITY=artist` (~2 GB compressed, expands to ~15-20 GB) — the real stress test. This is where streaming matters — you can't hold 20 GB in memory or on Cloud Run's ephemeral disk
+- [ ] Handle connection drops during large downloads — think about error handling and whether the MusicBrainz server supports range requests (for resumable downloads)
+- [ ] Ensure chunking is memory-efficient — don't accumulate all lines before writing a chunk. Write to a buffer, flush to GCS when the buffer hits the target size, reset
+- [ ] Add progress logging for long-running operations (chunk N uploaded, X MB so far, elapsed time)
+- [ ] Test that the BigQuery wildcard URI pattern loads all chunks in one job
+
+> **Concept — Backpressure**: When the producer (tar extractor) is faster than the consumer (GCS upload), you need a buffer strategy. Writing chunks at a fixed size naturally creates backpressure: you extract lines until you hit 100 MB, pause extraction, upload the chunk, then resume.
+>
+> **Concept — Logging**: Essential for debugging Cloud Run Jobs since you can't attach a debugger. Use Python's `logging` module, not `print()` — Cloud Run captures structured logs.
+>
+> **Study**: [Python `logging` module](https://docs.python.org/3/howto/logging.html) — basics of structured logging.
+>
+> **Study**: [Cloud Run Jobs logs](https://cloud.google.com/run/docs/logging) — how to view logs in Cloud Console / Cloud Logging.
+
+### 2.6 Package for Cloud Run
+
+Once the script runs successfully locally, package it for Cloud Run Jobs deployment.
 
 **Why source-based deployment?** Instead of writing a Dockerfile, building an image, and pushing it to a registry, `gcloud run jobs deploy --source` handles all of that automatically. Cloud Run uses Google Cloud Buildpacks to detect your Python project (via `requirements.txt` and `Procfile`), build a container image, store it in an auto-managed Artifact Registry repository, and deploy it.
+
+**One job, per-entity executions**: You deploy a single Cloud Run Job (`musicbrainz-bulk-load`). At deploy time, you set default env vars for shared config (`PROJECT_ID`, `BUCKET_NAME`). At execution time, you override the `ENTITY` env var to control which entity gets processed. This avoids maintaining four nearly-identical jobs.
 
 - [ ] Prepare the source directory with:
   - `bulk_load.py` (the script)
   - `requirements.txt` (`google-cloud-storage`, `google-cloud-bigquery`)
   - `Procfile` specifying the entry point (e.g., `web: python3 bulk_load.py`)
-- [ ] Deploy using `gcloud run jobs deploy --source`, configuring memory, CPU, timeout, and service account
-- [ ] Execute the job via `gcloud run jobs execute`
-- [ ] Monitor execution in Cloud Run logs
+- [ ] Decide on memory/CPU allocation — consider the streaming memory footprint vs. the CPU-to-memory constraints below. The artist entity's tar decompression is CPU-intensive
+- [ ] Decide on a timeout — the largest entity might take 20-30 minutes
+- [ ] Understand how the job authenticates to GCS/BigQuery (it uses the service account attached at deploy time — the pipeline SA from Phase 1)
+- [ ] Set shared config as default env vars at deploy time (`PROJECT_ID`, `BUCKET_NAME`); the `ENTITY` var is passed per execution
 
+> **Concept — Source-based deployment**: `gcloud run jobs deploy --source` detects your Python project (via `requirements.txt`), builds a container using Cloud Buildpacks, pushes the image to Artifact Registry, and creates/updates the Cloud Run Job. All in one command.
+>
+> **Concept — Buildpacks**: An alternative to Dockerfiles. They auto-detect language and framework, install dependencies, and create a container image. For Python, they look for `requirements.txt` and use the `Procfile` for the entry point.
+>
+> **Concept — Service account attachment**: Cloud Run Jobs run as a service account. The `--service-account` flag at deploy time determines what permissions the job has. You'll use the pipeline SA.
+>
 > **Important**: Use `gcloud run jobs deploy` (not `gcloud run deploy`). The `jobs` subcommand creates a Job (runs to completion and exits). `gcloud run deploy` creates a Service (HTTP endpoint with autoscaling). Both support `--source`, but they create different resource types.
 >
 > **CPU-to-memory constraints** (hard limits enforced by Cloud Run):
@@ -284,7 +405,25 @@ terraform/
 >
 > **Study**: [Google Cloud Buildpacks](https://cloud.google.com/docs/buildpacks/overview) — how buildpacks auto-detect your language. For Python, detection relies on `requirements.txt`.
 >
+> **Study**: [Procfile reference for Buildpacks](https://cloud.google.com/docs/buildpacks/python#application_entrypoint) — how to specify the entry point.
+>
 > **Study**: [Cloud Run CPU and memory configuration](https://cloud.google.com/run/docs/configuring/memory-limits) — valid CPU-to-memory combinations.
+
+### 2.7 Deploy, Execute, and Validate
+
+- [ ] Deploy the job once: `gcloud run jobs deploy musicbrainz-bulk-load --source ...` with default env vars for shared config
+- [ ] Execute for event first (smallest, fastest feedback): pass `ENTITY=event` as an env var override
+- [ ] Monitor logs in Cloud Console or via `gcloud run jobs executions logs`
+- [ ] Verify GCS chunks exist with expected sizes
+- [ ] Verify BigQuery table exists with correct schema and row count
+- [ ] Execute for the remaining entities one at a time (label, release-group, artist) — each is a separate execution of the same job
+- [ ] Final validation: compare row counts against [MusicBrainz published statistics](https://musicbrainz.org/statistics)
+
+> **Study**: [Executing Cloud Run Jobs](https://cloud.google.com/run/docs/execute/jobs) — manual and programmatic execution, including how to pass environment variable overrides with `--update-env-vars`.
+>
+> **Study**: [`gcloud run jobs execute` reference](https://cloud.google.com/sdk/gcloud/reference/run/jobs/execute) — the `--update-env-vars` flag for per-execution configuration.
+>
+> **Study**: [Cloud Run Jobs logs](https://cloud.google.com/run/docs/logging) — viewing execution logs.
 
 ---
 

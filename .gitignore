@@ -43,3 +43,6 @@ Thumbs.db
 logs/
 airflow-webserver.pid
 docker-compose.override.yml
+
+# Data
+data/

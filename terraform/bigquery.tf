@@ -1,4 +1,4 @@
-# Four datasets following the medallion architecture (raw -> staging -> curated -> analytics).
+# Four datasets following the medallion architecture (raw -> staging -> trusted -> semantic).
 # Each layer has independent access controls and clear data lineage.
 resource "google_bigquery_dataset" "raw_dataset" {
   project       = var.PROJECT_ID
@@ -16,18 +16,18 @@ resource "google_bigquery_dataset" "staging_dataset" {
   description   = "Dataset containing intermediate dbt models (views)."
 }
 
-resource "google_bigquery_dataset" "curated_dataset" {
+resource "google_bigquery_dataset" "trusted_dataset" {
   project       = var.PROJECT_ID
   location      = var.PROJECT_REGION
-  dataset_id    = "curated"
-  friendly_name = "Curated Layer Dataset"
+  dataset_id    = "trusted"
+  friendly_name = "Trusted Layer Dataset"
   description   = "Dataset containing cleaned, deduplicated, typed tables (dbt models)."
 }
 
-resource "google_bigquery_dataset" "analytics_dataset" {
+resource "google_bigquery_dataset" "semantic_dataset" {
   project       = var.PROJECT_ID
   location      = var.PROJECT_REGION
-  dataset_id    = "analytics"
-  friendly_name = "Analytics Layer Dataset"
+  dataset_id    = "semantic"
+  friendly_name = "Semantic Layer Dataset"
   description   = "Dataset containing final aggregated tables for visualization."
 }

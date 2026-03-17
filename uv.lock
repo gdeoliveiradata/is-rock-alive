@@ -859,6 +859,8 @@ dependencies = [
     { name = "dbt" },
     { name = "dbt-bigquery" },
     { name = "dlt" },
+    { name = "google-cloud-bigquery" },
+    { name = "google-cloud-storage" },
 ]
 
 [package.metadata]
@@ -866,6 +868,8 @@ requires-dist = [
     { name = "dbt", specifier = ">=1.0.0.40.15" },
     { name = "dbt-bigquery", specifier = ">=1.11.1" },
     { name = "dlt", specifier = ">=1.23.0" },
+    { name = "google-cloud-bigquery", specifier = ">=3.40.0" },
+    { name = "google-cloud-storage", specifier = ">=3.1.1" },
 ]
 
 [[package]]

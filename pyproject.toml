@@ -8,4 +8,6 @@ dependencies = [
     "dbt>=1.0.0.40.15",
     "dbt-bigquery>=1.11.1",
     "dlt>=1.23.0",
+    "google-cloud-bigquery>=3.40.0",
+    "google-cloud-storage>=3.1.1",
 ]

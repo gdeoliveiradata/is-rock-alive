@@ -49,6 +49,33 @@ def get_latest_dump_date() -> str:
     return resp.text.split()[0]
 
 
+def check_blobs_exist(
+    bucket: str,
+    entity: str,
+    dump_date: str,
+) -> bool:
+    """Check whether blobs already exist for this entity and date.
+
+    Uses ``max_results=1`` so the lookup short-circuits after the
+    first match.
+
+    Args:
+        bucket: GCS bucket name to check.
+        entity: MusicBrainz entity name (e.g. 'event').
+        dump_date: Dump date string used in the blob prefix.
+
+    Returns:
+        True if at least one blob exists at the prefix.
+    """
+    blob_prefix = f"mb-dump/{entity}/{dump_date}"
+    blobs = storage.Client().list_blobs(
+        bucket,
+        prefix=blob_prefix,
+        max_results=1,
+    )
+    return any(blobs)
+
+
 def download_dump(url: str) -> str:
     """Download a tar.xz dump to a temporary file.
 
@@ -200,13 +227,18 @@ def main() -> None:
     dump_date = get_latest_dump_date()
     dump_url = f"{DUMP_BASE_URL}/{dump_date}/{ENTITY}.tar.xz"
 
-    dump_path = download_dump(dump_url)
+    blob_exists = check_blobs_exist(GCS_LANDING_BUCKET, ENTITY, dump_date)
 
-    try:
-        extract_and_upload(dump_path, dump_date)
-    finally:
-        os.unlink(dump_path)
-        logger.info("Cleaned up temp file %s", dump_path)
+    if blob_exists:
+        logger.info("Dump already available at %s", GCS_LANDING_BUCKET)
+    else:
+        dump_path = download_dump(dump_url)
+
+        try:
+            extract_and_upload(dump_path, dump_date)
+        finally:
+            os.unlink(dump_path)
+            logger.info("Cleaned up temp file %s", dump_path)
 
 
 if __name__ == "__main__":

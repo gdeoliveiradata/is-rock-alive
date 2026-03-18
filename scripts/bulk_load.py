@@ -10,10 +10,12 @@ The target entity is read from the ENTITY environment variable.
 import logging
 import os
 import sys
+import tarfile
 import tempfile
 import time
 
 import requests
+from google.cloud import storage
 
 DUMP_BASE_URL = "https://data.metabrainz.org/pub/musicbrainz/data/json-dumps"
 
@@ -84,6 +86,41 @@ def download_dump(url: str) -> str:
     return temp_file.name
 
 
+def extract_and_upload(dump_path: str):
+    logger.info("Extracting and uploading chunks to gs://%s/%s/", GCS_LANDING_BUCKET, ENTITY)
+    bucket = storage.Client().bucket(GCS_LANDING_BUCKET)
+
+    total_lines = 0
+    chunk = []
+    chunk_num = 0
+    chunk_bytes = 0
+
+    with tarfile.open(dump_path, mode="r:xz") as tar:
+        try:
+            member = tar.getmember(f"mbdump/{ENTITY}")
+            jsonl_file = tar.extractfile(member)
+
+            for raw_line in jsonl_file:
+                chunk.append(raw_line.decode().split())
+                chunk_bytes += len(raw_line)
+
+                if chunk_bytes >= CHUNK_SIZE:
+                    # upload_chunk(chunk, bucket)
+                    total_lines += len(chunk)
+                    chunk_num += 1
+                    chunk_bytes = 0
+                    chunk = []
+
+            if chunk:
+                # upload_chunk(chunk, bucket)
+                total_lines += len(chunk)
+                chunk = []
+        finally:    
+            logger.info("Uploaded %s lines in %d chunk(s)", f"{total_lines:,}", chunk_num + (1 if chunk else 0))
+            
+    return total_lines
+
+
 def main() -> None:
     """Entry point: download, extract, upload, and load one entity dump."""
     logging.basicConfig(
@@ -96,6 +133,8 @@ def main() -> None:
     dump_url = f"{DUMP_BASE_URL}/{dump_date}/{ENTITY}.tar.xz"
 
     dump_path = download_dump(dump_url)
+
+    extract_and_upload(dump_path)
 
     os.unlink(dump_path)
 

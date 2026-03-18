@@ -1,8 +1,9 @@
 """Bulk-load a MusicBrainz JSON dump into GCS and BigQuery.
 
-Downloads a single entity dump (tar.xz) from the MusicBrainz mirror,
-extracts the JSONL content, chunks it into ~100 MB files, uploads to
-GCS, and loads into BigQuery with WRITE_TRUNCATE for idempotency.
+Downloads a single entity dump (tar.xz) from the MusicBrainz
+mirror, extracts the JSONL content, chunks it into ~250 MB files,
+uploads to GCS, and loads into BigQuery with WRITE_TRUNCATE for
+idempotency.
 
 The target entity is read from the ENTITY environment variable.
 """
@@ -25,7 +26,7 @@ BQ_RAW_DATASET = os.environ.get("BQ_RAW_DATASET", "raw")
 BQ_PROJECT = os.environ.get("BQ_PROJECT")
 
 DOWNLOAD_BUFFER = 8 * 1024 * 1024  # 8 MB download buffer.
-CHUNK_SIZE = 100 * 1024 * 1024  # ~100 MB blob size.
+CHUNK_SIZE = 250 * 1024 * 1024  # ~250 MB blob size.
 HTTP_TIMEOUT = 30  # Seconds for initial connection.
 
 logger = logging.getLogger(__name__)
@@ -80,14 +81,66 @@ def download_dump(url: str) -> str:
     elapsed = time.monotonic() - t0
     logger.info(
         "Downloaded %.1f MB in %.0fs -> %s",
-        size / 1024 / 1024, elapsed, temp_file.name,
+        size / 1024 / 1024,
+        elapsed,
+        temp_file.name,
     )
 
     return temp_file.name
 
 
-def extract_and_upload(dump_path: str):
-    logger.info("Extracting and uploading chunks to gs://%s/%s/", GCS_LANDING_BUCKET, ENTITY)
+def upload_chunk(
+    chunk: list[str],
+    bucket: storage.Bucket,
+    chunk_num: int,
+    entity: str,
+    dump_date: str,
+) -> None:
+    """Upload a single JSONL chunk to GCS.
+
+    Joins the buffered lines into a single newline-delimited string
+    and uploads it as a blob under the dump date prefix.
+
+    Args:
+        chunk: List of decoded JSONL lines to upload.
+        bucket: GCS bucket to upload into.
+        chunk_num: Zero-based sequence number for the chunk file.
+        entity: MusicBrainz entity name (e.g. 'event').
+        dump_date: Dump date string used in the blob path.
+    """
+    blob_name = f"mb-dump/{entity}/{dump_date}/{entity}_{chunk_num:03d}.jsonl"
+    blob = bucket.blob(blob_name)
+
+    data = "\n".join(chunk) + "\n"
+    logger.info(
+        "  %s: %s lines, %.1f MB",
+        blob_name,
+        f"{len(chunk):,}",
+        len(data) / 1024 / 1024,
+    )
+    blob.upload_from_string(data, content_type="application/jsonl")
+
+
+def extract_and_upload(dump_path: str, dump_date: str) -> int:
+    """Extract JSONL from a tar.xz archive and upload to GCS.
+
+    Opens the dump archive, reads lines from the matching entity
+    member, buffers them into CHUNK_SIZE batches, and uploads each
+    batch to GCS.  Logs a warning and returns 0 if the expected
+    member is not found.
+
+    Args:
+        dump_path: Local path to the downloaded tar.xz archive.
+        dump_date: Dump date string used in the GCS blob path.
+
+    Returns:
+        Total number of JSONL lines uploaded.
+    """
+    logger.info(
+        "Extracting and uploading chunks to gs://%s/%s/",
+        GCS_LANDING_BUCKET,
+        ENTITY,
+    )
     bucket = storage.Client().bucket(GCS_LANDING_BUCKET)
 
     total_lines = 0
@@ -95,29 +148,44 @@ def extract_and_upload(dump_path: str):
     chunk_num = 0
     chunk_bytes = 0
 
+    found = False
+
     with tarfile.open(dump_path, mode="r:xz") as tar:
-        try:
-            member = tar.getmember(f"mbdump/{ENTITY}")
+        for member in tar:
+            if member.name != f"mbdump/{ENTITY}":
+                continue
+
+            found = True
             jsonl_file = tar.extractfile(member)
+            if jsonl_file is None:
+                continue
 
             for raw_line in jsonl_file:
-                chunk.append(raw_line.decode().split())
-                chunk_bytes += len(raw_line)
+                line = raw_line.decode().strip()
+                chunk.append(line)
+                chunk_bytes += len(line)
 
                 if chunk_bytes >= CHUNK_SIZE:
-                    # upload_chunk(chunk, bucket)
+                    upload_chunk(chunk, bucket, chunk_num, ENTITY, dump_date)
                     total_lines += len(chunk)
                     chunk_num += 1
                     chunk_bytes = 0
                     chunk = []
 
-            if chunk:
-                # upload_chunk(chunk, bucket)
-                total_lines += len(chunk)
-                chunk = []
-        finally:    
-            logger.info("Uploaded %s lines in %d chunk(s)", f"{total_lines:,}", chunk_num + (1 if chunk else 0))
-            
+    if not found:
+        logger.warning("Member 'mbdump/%s' not found in %s", ENTITY, dump_path)
+        return 0
+
+    if chunk:
+        upload_chunk(chunk, bucket, chunk_num, ENTITY, dump_date)
+        total_lines += len(chunk)
+
+    logger.info(
+        "Uploaded %s lines in %d chunk(s)",
+        f"{total_lines:,}",
+        chunk_num + (1 if chunk else 0),
+    )
+
     return total_lines
 
 
@@ -134,9 +202,11 @@ def main() -> None:
 
     dump_path = download_dump(dump_url)
 
-    extract_and_upload(dump_path)
-
-    os.unlink(dump_path)
+    try:
+        extract_and_upload(dump_path, dump_date)
+    finally:
+        os.unlink(dump_path)
+        logger.info("Cleaned up temp file %s", dump_path)
 
 
 if __name__ == "__main__":

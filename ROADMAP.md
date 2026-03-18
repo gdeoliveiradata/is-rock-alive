@@ -244,16 +244,35 @@ Before writing any code, understand what you're ingesting.
 
 How BigQuery loads JSONL drives your chunking and schema decisions.
 
-- [ ] How does BigQuery infer schema from JSONL? (nested objects → `STRUCT`, arrays → `ARRAY`)
-- [ ] What's `autodetect` vs. explicit schema? Which fits MusicBrainz's consistent structure?
-- [ ] What's the `source_format` for JSONL? (`NEWLINE_DELIMITED_JSON`)
+**Raw table schema approach — schema-on-read with a JSON column**: Instead of using BigQuery's schema autodetect to create typed columns directly from JSONL, the raw layer uses a fixed, entity-agnostic schema: a handful of audit columns plus a single `data` column (BigQuery `JSON` type) that stores the entire JSON line as-is. All parsing and typing happens in the dbt staging layer (Phase 3).
+
+This decouples ingestion from schema management — upstream schema changes in MusicBrainz won't break the load job, and all transformation logic lives in one place (dbt).
+
+**Raw table schema:**
+| Column | Type | Description |
+|--------|------|-------------|
+| `data` | `JSON` | The full JSON object from one JSONL line |
+| `_source_file` | `STRING` | GCS blob path the row came from (traceability back to the exact file) |
+| `_loaded_at` | `TIMESTAMP` | When the row was loaded into BigQuery (enables deduplication and freshness checks) |
+| `_batch_id` | `STRING` | Unique ID per load run (e.g., UUID or Cloud Run execution ID). Lets you identify and roll back an entire bad load |
+| `_source_system` | `STRING` | Which pipeline produced the row (e.g., `bulk_load`, `incremental_api`). Useful when both ingestion paths write to the same table |
+| `_row_hash` | `STRING` | SHA256 hash of the `data` column. Enables cheap change detection without comparing full JSON blobs |
+
+- [ ] What's the BigQuery `JSON` data type? How does it differ from storing JSON as `STRING`?
+- [ ] How do you define an explicit schema in `LoadJobConfig` instead of using `autodetect`?
+- [ ] What's `source_format` for JSONL? (`NEWLINE_DELIMITED_JSON`)
 - [ ] What are the load job limits? (max file size, row size, nested depth)
 - [ ] `WRITE_TRUNCATE` vs. `WRITE_APPEND` — which makes the bulk load idempotent?
 - [ ] What's a wildcard URI? (`gs://bucket/entity/*.jsonl` loads all chunks in one job)
+- [ ] How do you query a `JSON` column? (`JSON_VALUE()`, `JSON_EXTRACT()`, `JSON_EXTRACT_ARRAY()`)
 
 > **Study**: [Loading JSON into BigQuery](https://cloud.google.com/bigquery/docs/loading-data-cloud-storage-json) | [Schema autodetection](https://cloud.google.com/bigquery/docs/schema-detect) | [Load job limits](https://cloud.google.com/bigquery/quotas#load_jobs)
 >
 > **Study**: [BigQuery Python client — `LoadJobConfig`](https://cloud.google.com/python/docs/reference/bigquery/latest/google.cloud.bigquery.job.LoadJobConfig)
+>
+> **Study**: [BigQuery JSON data type](https://cloud.google.com/bigquery/docs/reference/standard-sql/json-types) — native JSON type, querying with `JSON_VALUE` and `JSON_QUERY`, and performance considerations vs. `STRING`.
+>
+> **Study**: [Querying JSON data in BigQuery](https://cloud.google.com/bigquery/docs/json-data) — extracting fields, arrays, and nested objects from JSON columns.
 
 ### 2.3 Write the Script — Step by Step
 
@@ -294,7 +313,9 @@ Build `scripts/bulk_load.py` incrementally, testing each piece before moving on.
 **Step D — Load GCS chunks into BigQuery**
 - [ ] Write `load_to_bigquery(rows_uploaded)` — load all chunks into a BigQuery table
 - [ ] Source URI: `gs://{BUCKET_NAME}/bulk/{ENTITY}/*.jsonl` (wildcard loads all chunks in one job)
-- [ ] Configure `LoadJobConfig`: `source_format=NEWLINE_DELIMITED_JSON`, `autodetect=True`, `write_disposition=WRITE_TRUNCATE`
+- [ ] Define an explicit schema with three columns: `data` (JSON), `_source_file` (STRING), `_loaded_at` (TIMESTAMP). Do NOT use `autodetect` — the fixed schema is intentional (see 2.2)
+- [ ] Configure `LoadJobConfig`: `source_format=NEWLINE_DELIMITED_JSON`, `write_disposition=WRITE_TRUNCATE`, explicit schema
+- [ ] Think about how to populate the audit columns (`_source_file`, `_loaded_at`, `_batch_id`, `_source_system`, `_row_hash`) — can a JSONL load job populate columns that don't exist in the source data? If not, what alternatives are there? (Hint: consider a two-step approach, or adding audit columns after loading, or restructuring the JSONL before upload)
 - [ ] Enable ingestion-time partitioning — BigQuery adds `_PARTITIONTIME` automatically. Use `TimePartitioning(type_=TimePartitioningType.DAY)` in the job config
 - [ ] Handle entity names with hyphens — BigQuery tables can't have hyphens (e.g. `release-group` → `release_group`)
 - [ ] Call `load_table_from_uri()`, then `.result()` to block until the job completes
@@ -302,6 +323,8 @@ Build `scripts/bulk_load.py` incrementally, testing each piece before moving on.
 - [ ] Test: run the full pipeline with event, verify the table exists in BigQuery with the right schema and row count
 
 > **Study**: [BigQuery `load_table_from_uri`](https://cloud.google.com/python/docs/reference/bigquery/latest/google.cloud.bigquery.client.Client#google_cloud_bigquery_client_Client_load_table_from_uri)
+>
+> **Design note**: Loading JSONL into a single `data` column requires the source JSONL to be wrapped so each line becomes a JSON object with a `data` key, OR the data is loaded as raw JSON strings and cast. Think through which approach is cleanest for populating the six-column schema (data + five audit columns).
 
 **Step E — Skip check**
 - [ ] Before downloading, check if blobs already exist at `gs://bucket/bulk/{entity}/`
@@ -376,19 +399,24 @@ Build `scripts/bulk_load.py` incrementally, testing each piece before moving on.
 > - **Semantic**: pre-aggregated tables optimized for specific dashboard queries. Keeps Looker Studio fast by avoiding complex JOINs at query time.
 
 ### 3.2 Staging Models (raw -> staging)
-- [ ] `stg_artists` — parse JSON, cast types, rename columns, add surrogate keys
-- [ ] `stg_release_groups` — normalize release types, extract year from date
-- [ ] `stg_labels` — clean label data
-- [ ] `stg_events` — parse event dates and types
-- [ ] `stg_artist_tags` — flatten tag associations, filter for genre-like tags
+
+**Key change from the JSON column approach**: Since raw tables store the full JSON object in a `data` column (see 2.2), staging models are responsible for extracting, typing, and naming all fields. Use `JSON_VALUE(data, '$.field')` for scalar values and `JSON_EXTRACT_ARRAY(data, '$.field')` for arrays. This is where all schema interpretation happens.
+
+- [ ] `stg_artists` — extract fields from `data` JSON column (`JSON_VALUE` for scalars, `JSON_EXTRACT_ARRAY` for tags/aliases), cast types, rename columns, deduplicate by latest record per MBID
+- [ ] `stg_release_groups` — extract from JSON, normalize release types, extract year from date
+- [ ] `stg_labels` — extract from JSON, clean label data
+- [ ] `stg_events` — extract from JSON, parse event dates and types
+- [ ] `stg_artist_tags` — extract and flatten tag array from JSON, filter for genre-like tags
 - [ ] `stg_release_group_tags` — same for release groups
 - [ ] Materialization: `view` (lightweight, always fresh)
 
-> **Why views for staging?** Views don't store data — they're computed on read. Since staging models just rename/cast columns, there's no performance benefit to materializing them as tables. This saves storage cost and ensures staging always reflects the latest raw data.
+> **Why views for staging?** Views don't store data — they're computed on read. Since staging models are wrappers over raw, there's no performance benefit to materializing them as tables. This saves storage cost and ensures staging always reflects the latest raw data.
 >
 > **Study**: [dbt materializations](https://docs.getdbt.com/docs/build/materializations) — view, table, incremental, and ephemeral.
 >
 > **Study**: [BigQuery STRUCT and ARRAY types](https://cloud.google.com/bigquery/docs/nested-repeated) — how BigQuery handles nested/repeated data natively. Important for deciding whether to flatten nested MusicBrainz fields.
+>
+> **Study**: [Querying JSON data in BigQuery](https://cloud.google.com/bigquery/docs/json-data) — `JSON_VALUE`, `JSON_QUERY`, `JSON_EXTRACT_ARRAY` for parsing the raw JSON column in staging models.
 
 ### 3.3 Seeds (Genre Mapping)
 
@@ -499,10 +527,12 @@ Build `scripts/bulk_load.py` incrementally, testing each piece before moving on.
 
 ### 4.3 Load Incremental Data to BigQuery
 - [ ] Append new records to `raw.<entity>` tables (WRITE_APPEND)
-- [ ] Use a `_load_timestamp` column to track when records were ingested
-- [ ] Deduplication happens in the dbt staging layer (latest record per MBID)
+- [ ] Use the same raw table schema as bulk load: `data` (JSON) + audit columns (`_source_file`, `_loaded_at`, `_batch_id`, `_source_system`, `_row_hash`). This keeps both ingestion paths writing to the same tables with the same structure.
+- [ ] Deduplication happens in the dbt staging layer (latest record per MBID, using `_loaded_at` to determine recency)
 
 > **Why append instead of upsert at the raw layer?** Keeping raw as append-only preserves history and keeps ingestion simple. All 3 versions of an artist from 3 daily loads are kept in raw. The dbt staging layer deduplicates by taking the latest record per MBID.
+>
+> **Why the same schema?** Bulk and incremental loads write to the same raw tables. A uniform schema (`data` + audit columns) means dbt staging models don't need to handle two different source structures.
 
 ### 4.4 Deploy to Cloud Run
 - [ ] Same source-based deployment pattern as Phase 2 (script + `requirements.txt` + `Procfile`)

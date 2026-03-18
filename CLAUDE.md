@@ -59,8 +59,8 @@ gs://is-rock-alive-landing/
 
 ## BigQuery Datasets
 
-- `raw` — JSONL loads from GCS, ingestion-time partitioned (`_PARTITIONTIME`)
-- `staging` — dbt views: clean, type-cast, renamed columns
+- `raw` — JSONL loads from GCS, fixed schema per table (`data` JSON + audit columns: `_source_file`, `_loaded_at`, `_batch_id`, `_source_system`, `_row_hash`), ingestion-time partitioned (`_PARTITIONTIME`)
+- `staging` — dbt views: extract fields from `data` JSON column, type-cast, renamed columns, deduplicate
 - `trusted` — dbt tables: deduplicated dimensions and facts (star schema)
 - `semantic` — dbt tables: aggregated models for Looker Studio
 
@@ -103,16 +103,17 @@ pytest tests/
 - **GCS landing bucket is a permanent archive**: Data stays in GCS as an immutable copy. If BigQuery loads fail or transformations have bugs, you can reprocess from the landing bucket.
 - **dlt stages through GCS**: dlt uses `gs://landing/dlt-staging/` as a staging area before loading into BigQuery. This is why a separate staging bucket is not needed.
 - **dbt runs on the Airflow VM**: The e2-small VM (2 vCPUs, 2 GB RAM) handles dbt fine — dbt compiles SQL and sends it to BigQuery, no heavy local processing. This avoids a separate Cloud Run Job for dbt and keeps the architecture simpler.
-- **JSONL for raw layer**: Matches source format, BigQuery loads JSONL natively for free, schema autodetect works well.
+- **Schema-on-read raw layer**: Raw BigQuery tables use a fixed, entity-agnostic schema: `data` (JSON), `_source_file` (STRING), `_loaded_at` (TIMESTAMP), `_batch_id` (STRING), `_source_system` (STRING), `_row_hash` (STRING). No schema autodetect — all parsing and typing happens in dbt staging models via `JSON_VALUE`/`JSON_EXTRACT_ARRAY`. This decouples ingestion from schema management: upstream MusicBrainz schema changes don't break the load job, and all transformation logic lives in one place (dbt).
+- **JSONL for raw layer**: Matches source format, BigQuery loads JSONL natively for free.
 - **Genre via tags**: MusicBrainz has no genre field — genres come from the tag system. A `genre_mapping` dbt seed maps raw tags to standardized categories.
 - **Region**: `us-central1` for all resources (GCS, BigQuery, Cloud Run, GCE). Same-region = free data transfer.
 
 ## Data Flow
 
-1. **Bulk ingest (one-time)**: MusicBrainz tar.xz dump → `bulk_load.py` on Cloud Run → `gs://landing/bulk/{entity}/` → BigQuery `raw` (WRITE_TRUNCATE, ingestion-time partitioned)
-2. **Incremental ingest (daily)**: MusicBrainz API → dlt on Cloud Run → `gs://landing/incremental/{entity}/{date}/` → BigQuery `raw` (WRITE_APPEND, ingestion-time partitioned)
+1. **Bulk ingest (one-time)**: MusicBrainz tar.xz dump → `bulk_load.py` on Cloud Run → `gs://landing/bulk/{entity}/` → BigQuery `raw` (WRITE_TRUNCATE, fixed schema: `data` JSON + audit cols)
+2. **Incremental ingest (daily)**: MusicBrainz API → dlt on Cloud Run → `gs://landing/incremental/{entity}/{date}/` → BigQuery `raw` (WRITE_APPEND, same fixed schema)
 3. **Transform (dbt on Airflow VM)**:
-   - `staging` (views) — clean, cast, rename, deduplicate (latest per MBID), 1:1 with raw tables
+   - `staging` (views) — extract fields from `data` JSON column, cast, rename, deduplicate (latest per MBID), 1:1 with raw tables
    - `trusted` (tables) — star schema: dims (artists, release_groups, labels, events, genres) + facts + bridges
    - `semantic` (tables) — pre-aggregated for dashboards (rock trends by year/subgenre/label)
 4. **Serve**: BigQuery `semantic` → Looker Studio dashboards

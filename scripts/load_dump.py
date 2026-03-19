@@ -216,10 +216,6 @@ def extract_and_upload(dump_path: str, dump_date: str) -> int:
     return total_lines
 
 
-def load_to_bigquery():
-    
-
-
 def main() -> None:
     """Orchestrate the full dump-load pipeline for one entity.
 

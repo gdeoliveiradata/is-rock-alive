@@ -9,7 +9,7 @@ MusicBrainz data engineering project on GCP. Ingests music metadata (artists, re
 ## Architecture
 
 ```
-MusicBrainz Dump (tar.xz/JSONL) --> [bulk_load.py on Cloud Run Job] --> GCS Landing Bucket --> BigQuery (raw)
+MusicBrainz Dump (tar.xz/JSONL) --> [load_dump.py on Cloud Run Job] --> GCS Landing Bucket --> BigQuery (raw)
 MusicBrainz API (daily incremental) --> [dlt on Cloud Run Job] --> GCS Landing Bucket --> BigQuery (raw)
 BigQuery (raw) --> dbt (on Airflow VM) --> staging --> trusted --> semantic --> Looker Studio
 Orchestration: Airflow on GCE VM (e2-small, scheduling + dbt execution)
@@ -78,7 +78,7 @@ dbt test --target dev
 dbt build --target dev          # run + test combined
 
 # Bulk load (local)
-ENTITY=event uv run python scripts/bulk_load.py
+ENTITY=event uv run python scripts/load_dump.py
 
 # Linting
 sqlfluff lint dbt/models/       # SQL linting (BigQuery dialect)
@@ -95,7 +95,7 @@ pytest tests/
 - **Additive IAM bindings**: Use `google_project_iam_member` (additive) in Terraform, not `google_project_iam_binding` or `google_project_iam_policy`. Avoids revoking permissions from the user account or Google-managed SAs.
 - **No JSON key files**: SA key creation is disabled by org policy. Locally, authenticate via ADC (`gcloud auth application-default login`). In CI/CD, GitHub Actions uses Workload Identity Federation.
 - **Cloud Run managed via `gcloud`, not Terraform**: Source-based deployment (`gcloud run jobs deploy --source`) builds and deploys in one step. Terraform can't do this.
-- **Two ingestion approaches**: Bulk load (`bulk_load.py`) is a one-time dump load using `google-cloud-storage` + `google-cloud-bigquery`. Daily incremental uses dlt (pagination, rate limiting, watermarks). dbt owns all transformations.
+- **Two ingestion approaches**: Bulk load (`load_dump.py`) is a one-time dump load using `google-cloud-storage` + `google-cloud-bigquery`. Daily incremental uses dlt (pagination, rate limiting, watermarks). dbt owns all transformations.
 - **Bulk load skip logic**: Checks if blobs already exist at `gs://landing/bulk/{entity}/`. If files exist, logs a message and exits cleanly (not an error). To rerun, manually delete the GCS files first. No force flag.
 - **Bulk load uses `WRITE_TRUNCATE`**: Full table replace in BigQuery for idempotency.
 - **Incremental uses `WRITE_APPEND`**: Raw tables are append-only, dbt staging deduplicates by latest record per MBID.
@@ -110,7 +110,7 @@ pytest tests/
 
 ## Data Flow
 
-1. **Bulk ingest (one-time)**: MusicBrainz tar.xz dump → `bulk_load.py` on Cloud Run → `gs://landing/bulk/{entity}/` → BigQuery `raw` (WRITE_TRUNCATE, fixed schema: `data` JSON + audit cols)
+1. **Bulk ingest (one-time)**: MusicBrainz tar.xz dump → `load_dump.py` on Cloud Run → `gs://landing/bulk/{entity}/` → BigQuery `raw` (WRITE_TRUNCATE, fixed schema: `data` JSON + audit cols)
 2. **Incremental ingest (daily)**: MusicBrainz API → dlt on Cloud Run → `gs://landing/incremental/{entity}/{date}/` → BigQuery `raw` (WRITE_APPEND, same fixed schema)
 3. **Transform (dbt on Airflow VM)**:
    - `staging` (views) — extract fields from `data` JSON column, cast, rename, deduplicate (latest per MBID), 1:1 with raw tables
@@ -125,7 +125,7 @@ pytest tests/
 2. `BashOperator` → `dbt run` (locally on VM)
 3. `BashOperator` → `dbt test` (locally on VM)
 
-**Initial load DAG** (manual, one-time): triggers bulk_load.py Cloud Run Job per entity, then full dbt run.
+**Initial load DAG** (manual, one-time): triggers load_dump.py Cloud Run Job per entity, then full dbt run.
 
 ## MusicBrainz API Notes
 

@@ -16,7 +16,7 @@ import tempfile
 import time
 
 import requests
-from google.cloud import storage
+from google.cloud import storage, bigquery
 
 DUMP_BASE_URL = "https://data.metabrainz.org/pub/musicbrainz/data/json-dumps"
 
@@ -216,8 +216,25 @@ def extract_and_upload(dump_path: str, dump_date: str) -> int:
     return total_lines
 
 
+def load_to_bigquery():
+    
+
+
 def main() -> None:
-    """Entry point: download, extract, upload, and load one entity dump."""
+    """Orchestrate the full dump-load pipeline for one entity.
+
+    Flow: fetch latest dump date → skip check → download → extract
+    and upload to GCS → clean up temp file.
+
+    Exits cleanly (no error) if blobs already exist for the entity
+    and dump date — to rerun, delete the GCS files first.
+
+    The temp file is always removed, even if extraction fails.
+
+    Configuration is read from environment variables at module level:
+    ``ENTITY`` (required), ``GCS_LANDING_BUCKET``, ``BQ_RAW_DATASET``,
+    and ``BQ_PROJECT`` (optional, with defaults).
+    """
     logging.basicConfig(
         level=logging.INFO,
         stream=sys.stdout,

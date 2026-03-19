@@ -207,7 +207,7 @@ terraform/
 
 ## Phase 2: Data Ingestion — Initial Bulk Load
 
-One Python script (`scripts/bulk_load.py`) that downloads a MusicBrainz entity dump, chunks it into JSONL files, uploads to GCS, and loads into BigQuery. Runs locally first, then on Cloud Run Jobs.
+One Python script (`scripts/load_dump.py`) that downloads a MusicBrainz entity dump, chunks it into JSONL files, uploads to GCS, and loads into BigQuery. Runs locally first, then on Cloud Run Jobs.
 
 **Target script pipeline:**
 ```
@@ -276,7 +276,7 @@ This decouples ingestion from schema management — upstream schema changes in M
 
 ### 2.3 Write the Script — Step by Step
 
-Build `scripts/bulk_load.py` incrementally, testing each piece before moving on. Start with `ENTITY=event` (smallest, fastest feedback).
+Build `scripts/load_dump.py` incrementally, testing each piece before moving on. Start with `ENTITY=event` (smallest, fastest feedback).
 
 **Step A — Configuration and setup**
 - [ ] Read `ENTITY` from `os.environ` (fail fast with `KeyError` if missing)
@@ -347,7 +347,7 @@ Build `scripts/bulk_load.py` incrementally, testing each piece before moving on.
 
 ### 2.5 Package and Deploy on Cloud Run
 
-- [ ] Create a source directory for the Cloud Run Job with: `bulk_load.py`, `requirements.txt` (`requests`, `google-cloud-storage`, `google-cloud-bigquery`), `Procfile`
+- [ ] Create a source directory for the Cloud Run Job with: `load_dump.py`, `requirements.txt` (`requests`, `google-cloud-storage`, `google-cloud-bigquery`), `Procfile`
 - [ ] Choose memory/CPU allocation (artist needs ~4 GiB for the temp file + processing)
 - [ ] Deploy: `gcloud run jobs deploy --source` with `--service-account` (pipeline SA from Phase 1)
 - [ ] Set shared env vars at deploy time (`BUCKET_NAME`, `BQ_DATASET`); override `ENTITY` per execution

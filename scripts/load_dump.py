@@ -8,12 +8,14 @@ idempotency.
 The target entity is read from the ENTITY environment variable.
 """
 
+import json
 import logging
 import os
 import sys
 import tarfile
 import tempfile
 import time
+from datetime import datetime, timezone
 
 import requests
 from google.cloud import storage, bigquery
@@ -49,27 +51,21 @@ def get_latest_dump_date() -> str:
     return resp.text.split()[0]
 
 
-def check_blobs_exist(
-    bucket: str,
-    entity: str,
-    dump_date: str,
-) -> bool:
+def check_blobs_exist(dump_date: str) -> bool:
     """Check whether blobs already exist for this entity and date.
 
     Uses ``max_results=1`` so the lookup short-circuits after the
     first match.
 
     Args:
-        bucket: GCS bucket name to check.
-        entity: MusicBrainz entity name (e.g. 'event').
         dump_date: Dump date string used in the blob prefix.
 
     Returns:
         True if at least one blob exists at the prefix.
     """
-    blob_prefix = f"mb-dump/{entity}/{dump_date}"
+    blob_prefix = f"mb-dump/{ENTITY}/{dump_date}"
     blobs = storage.Client().list_blobs(
-        bucket,
+        GCS_LANDING_BUCKET,
         prefix=blob_prefix,
         max_results=1,
     )
@@ -116,11 +112,45 @@ def download_dump(url: str) -> str:
     return temp_file.name
 
 
+def create_json_line(
+    line: str,
+    load_time: str,
+    chunk_num: int,
+    dump_date: str,
+) -> str:
+    """Wrap a raw JSONL line with audit metadata columns.
+
+    Parses the original JSON string, nests it under ``json_data``,
+    and adds audit columns (source file, source system, batch ID,
+    and landing timestamp).
+
+    Args:
+        line: A single raw JSONL line from the dump.
+        load_time: ISO 8601 UTC timestamp for the load run.
+        chunk_num: Current chunk number (used in source file path).
+        dump_date: Dump date string used in the source file path.
+
+    Returns:
+        A JSON string with the wrapped structure ready for upload.
+    """
+    parsed_dict = json.loads(line)
+    source_file = f"mb-dump/{ENTITY}/{dump_date}/{ENTITY}_{chunk_num:03d}.jsonl"
+
+    json_line = json.dumps({
+        "json_data": parsed_dict,
+        "_source_file": source_file,
+        "_source_system": "MusicBrainz JSON Dump",
+        "_batch_id": dump_date,
+        "_landing_loaded_at": load_time,
+    })
+
+    return json_line
+
+
 def upload_chunk(
     chunk: list[str],
     bucket: storage.Bucket,
     chunk_num: int,
-    entity: str,
     dump_date: str,
 ) -> None:
     """Upload a single JSONL chunk to GCS.
@@ -132,10 +162,9 @@ def upload_chunk(
         chunk: List of decoded JSONL lines to upload.
         bucket: GCS bucket to upload into.
         chunk_num: Zero-based sequence number for the chunk file.
-        entity: MusicBrainz entity name (e.g. 'event').
         dump_date: Dump date string used in the blob path.
     """
-    blob_name = f"mb-dump/{entity}/{dump_date}/{entity}_{chunk_num:03d}.jsonl"
+    blob_name = f"mb-dump/{ENTITY}/{dump_date}/{ENTITY}_{chunk_num:03d}.jsonl"
     blob = bucket.blob(blob_name)
 
     data = "\n".join(chunk) + "\n"
@@ -175,6 +204,8 @@ def extract_and_upload(dump_path: str, dump_date: str) -> int:
     chunk_num = 0
     chunk_bytes = 0
 
+    load_time = datetime.now(timezone.utc).isoformat()
+
     found = False
 
     with tarfile.open(dump_path, mode="r:xz") as tar:
@@ -189,11 +220,12 @@ def extract_and_upload(dump_path: str, dump_date: str) -> int:
 
             for raw_line in jsonl_file:
                 line = raw_line.decode().strip()
-                chunk.append(line)
+                json_line = create_json_line(line, load_time, chunk_num, dump_date)
+                chunk.append(json_line)
                 chunk_bytes += len(line)
 
                 if chunk_bytes >= CHUNK_SIZE:
-                    upload_chunk(chunk, bucket, chunk_num, ENTITY, dump_date)
+                    upload_chunk(chunk, bucket, chunk_num, dump_date)
                     total_lines += len(chunk)
                     chunk_num += 1
                     chunk_bytes = 0
@@ -204,7 +236,7 @@ def extract_and_upload(dump_path: str, dump_date: str) -> int:
         return 0
 
     if chunk:
-        upload_chunk(chunk, bucket, chunk_num, ENTITY, dump_date)
+        upload_chunk(chunk, bucket, chunk_num, dump_date)
         total_lines += len(chunk)
 
     logger.info(
@@ -216,11 +248,87 @@ def extract_and_upload(dump_path: str, dump_date: str) -> int:
     return total_lines
 
 
+def get_table_id() -> str:
+    """Build a fully-qualified BigQuery table ID for the current entity.
+
+    Converts entity names with hyphens to underscores
+    (e.g. ``release-group`` -> ``release_group``), since BigQuery
+    table names cannot contain hyphens.
+
+    Returns:
+        A fully-qualified table ID in the form
+        ``project.dataset.table`` or ``dataset.table``.
+    """
+    table_name = ENTITY.replace("-", "_")
+    if BQ_PROJECT:
+        return f"{BQ_PROJECT}.{BQ_RAW_DATASET}.{table_name}"
+    return f"{BQ_RAW_DATASET}.{table_name}"
+
+
+def load_to_bigquery(dump_date: str, rows_uploaded: int) -> None:
+    """Load JSONL chunks from GCS into a BigQuery raw table.
+
+    Uses a wildcard URI to load all chunks for the entity in a single
+    job.  After loading, compares the BigQuery row count against
+    ``rows_uploaded`` and logs a warning on mismatch.
+
+    Args:
+        dump_date: Dump date string used in the GCS path.
+        rows_uploaded: Expected number of rows (from extract_and_upload).
+    """
+    client = bigquery.Client(BQ_PROJECT)
+
+    source_uri = (
+        f"gs://{GCS_LANDING_BUCKET}/mb-dump/{ENTITY}/{dump_date}/*.jsonl"
+    )
+    table_id = get_table_id()
+
+    logger.info("Loading %s -> %s", source_uri, table_id)
+
+    table_schema = [
+        bigquery.SchemaField(name="json_data", field_type="JSON", mode="REQUIRED"),
+        bigquery.SchemaField(name="_source_file", field_type="STRING", mode="REQUIRED"),
+        bigquery.SchemaField(name="_source_system", field_type="STRING", mode="REQUIRED"),
+        bigquery.SchemaField(name="_batch_id", field_type="STRING", mode="REQUIRED"),
+        bigquery.SchemaField(name="_landing_loaded_at", field_type="TIMESTAMP", mode="REQUIRED"),
+        bigquery.SchemaField(
+            name="_raw_loaded_at",
+            field_type="TIMESTAMP",
+            mode="REQUIRED",
+            default_value_expression="CURRENT_TIMESTAMP()",
+        )
+    ]
+
+    job_config = bigquery.LoadJobConfig(
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        schema=table_schema,
+    )
+
+    load_job = client.load_table_from_uri(source_uri, table_id, job_config=job_config)
+    load_job.result()
+
+    table = client.get_table(table_id)
+    logger.info(
+        "Loaded %s rows into %s (expected %s)",
+        f"{table.num_rows:,}",
+        table_id,
+        f"{rows_uploaded:,}",
+    )
+
+    if table.num_rows != rows_uploaded:
+        logger.warning(
+            "Row count mismatch: BigQuery has %s rows, but %s lines were uploaded",
+            f"{table.num_rows:,}",
+            f"{rows_uploaded:,}",
+        )
+
+
 def main() -> None:
     """Orchestrate the full dump-load pipeline for one entity.
 
     Flow: fetch latest dump date → skip check → download → extract
-    and upload to GCS → clean up temp file.
+    and upload to GCS → load into BigQuery → clean up temp file.
 
     Exits cleanly (no error) if blobs already exist for the entity
     and dump date — to rerun, delete the GCS files first.
@@ -237,21 +345,30 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
+    t0 = time.monotonic()
+    logger.info("=== bulk_load: entity=%s ===", ENTITY)
+
     dump_date = get_latest_dump_date()
     dump_url = f"{DUMP_BASE_URL}/{dump_date}/{ENTITY}.tar.xz"
 
-    blob_exists = check_blobs_exist(GCS_LANDING_BUCKET, ENTITY, dump_date)
+    blob_exist = check_blobs_exist(dump_date)
 
-    if blob_exists:
-        logger.info("Dump already available at %s", GCS_LANDING_BUCKET)
-    else:
-        dump_path = download_dump(dump_url)
+    if blob_exist:
+        logger.info("Dump already available at %s, skipping", GCS_LANDING_BUCKET)
+        return
 
-        try:
-            extract_and_upload(dump_path, dump_date)
-        finally:
-            os.unlink(dump_path)
-            logger.info("Cleaned up temp file %s", dump_path)
+    dump_path = download_dump(dump_url)
+
+    try:
+        rows_uploaded = extract_and_upload(dump_path, dump_date)
+    finally:
+        os.unlink(dump_path)
+        logger.info("Cleaned up temp file %s", dump_path)
+
+    load_to_bigquery(dump_date, rows_uploaded)
+
+    elapsed = time.monotonic() - t0
+    logger.info("=== Done: %s lines in %.0fs ===", f"{rows_uploaded:,}", elapsed)
 
 
 if __name__ == "__main__":

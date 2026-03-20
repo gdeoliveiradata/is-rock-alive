@@ -8,7 +8,6 @@ idempotency.
 The target entity is read from the ENTITY environment variable.
 """
 
-import json
 import logging
 import os
 import sys
@@ -17,6 +16,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
+import orjson
 import requests
 from google.cloud import storage, bigquery
 
@@ -28,7 +28,7 @@ BQ_RAW_DATASET = os.environ.get("BQ_RAW_DATASET", "raw")
 BQ_PROJECT = os.environ.get("BQ_PROJECT")
 
 DOWNLOAD_BUFFER = 8 * 1024 * 1024  # 8 MB download buffer.
-CHUNK_SIZE = 250 * 1024 * 1024  # ~250 MB blob size.
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE_MB", 100)) * 1024 * 1024  # ~100 MB blob size.
 HTTP_TIMEOUT = 30  # Seconds for initial connection.
 
 logger = logging.getLogger(__name__)
@@ -133,16 +133,16 @@ def create_json_line(
     Returns:
         A JSON string with the wrapped structure ready for upload.
     """
-    parsed_dict = json.loads(line)
+    parsed_dict = orjson.loads(line)
     source_file = f"mb-dump/{ENTITY}/{dump_date}/{ENTITY}_{chunk_num:03d}.jsonl"
 
-    json_line = json.dumps({
+    json_line = orjson.dumps({
         "json_data": parsed_dict,
         "_source_file": source_file,
         "_source_system": "MusicBrainz JSON Dump",
         "_batch_id": dump_date,
         "_landing_loaded_at": load_time,
-    })
+    }).decode()
 
     return json_line
 
@@ -222,7 +222,7 @@ def extract_and_upload(dump_path: str, dump_date: str) -> int:
                 line = raw_line.decode().strip()
                 json_line = create_json_line(line, load_time, chunk_num, dump_date)
                 chunk.append(json_line)
-                chunk_bytes += len(line)
+                chunk_bytes += len(json_line)
 
                 if chunk_bytes >= CHUNK_SIZE:
                     upload_chunk(chunk, bucket, chunk_num, dump_date)
@@ -248,6 +248,7 @@ def extract_and_upload(dump_path: str, dump_date: str) -> int:
     return total_lines
 
 
+
 def get_table_id() -> str:
     """Build a fully-qualified BigQuery table ID for the current entity.
 
@@ -265,16 +266,17 @@ def get_table_id() -> str:
     return f"{BQ_RAW_DATASET}.{table_name}"
 
 
-def load_to_bigquery(dump_date: str, rows_uploaded: int) -> None:
+def load_to_bigquery(dump_date: str, rows_uploaded: int | None = None) -> None:
     """Load JSONL chunks from GCS into a BigQuery raw table.
 
     Uses a wildcard URI to load all chunks for the entity in a single
-    job.  After loading, compares the BigQuery row count against
-    ``rows_uploaded`` and logs a warning on mismatch.
+    job.  When ``rows_uploaded`` is provided, compares the BigQuery row
+    count against it and logs a warning on mismatch.
 
     Args:
         dump_date: Dump date string used in the GCS path.
         rows_uploaded: Expected number of rows (from extract_and_upload).
+            When None, row count validation is skipped.
     """
     client = bigquery.Client(BQ_PROJECT)
 
@@ -294,8 +296,7 @@ def load_to_bigquery(dump_date: str, rows_uploaded: int) -> None:
         bigquery.SchemaField(
             name="_raw_loaded_at",
             field_type="TIMESTAMP",
-            mode="REQUIRED",
-            default_value_expression="CURRENT_TIMESTAMP()",
+            mode="NULLABLE",
         )
     ]
 
@@ -308,30 +309,42 @@ def load_to_bigquery(dump_date: str, rows_uploaded: int) -> None:
     load_job = client.load_table_from_uri(source_uri, table_id, job_config=job_config)
     load_job.result()
 
-    table = client.get_table(table_id)
-    logger.info(
-        "Loaded %s rows into %s (expected %s)",
-        f"{table.num_rows:,}",
-        table_id,
-        f"{rows_uploaded:,}",
+    logger.info("Setting _raw_loaded_at on %s", table_id)
+    update_query = (
+        f"UPDATE `{table_id}` "
+        "SET _raw_loaded_at = CURRENT_TIMESTAMP() "
+        "WHERE _raw_loaded_at IS NULL"
     )
+    client.query(update_query).result()
 
-    if table.num_rows != rows_uploaded:
-        logger.warning(
-            "Row count mismatch: BigQuery has %s rows, but %s lines were uploaded",
+    table = client.get_table(table_id)
+
+    if rows_uploaded is not None:
+        logger.info(
+            "Loaded %s rows into %s (expected %s)",
             f"{table.num_rows:,}",
+            table_id,
             f"{rows_uploaded:,}",
         )
+        if table.num_rows != rows_uploaded:
+            logger.warning(
+                "Row count mismatch: BigQuery has %s rows, but %s lines were uploaded",
+                f"{table.num_rows:,}",
+                f"{rows_uploaded:,}",
+            )
+    else:
+        logger.info("Loaded %s rows into %s", f"{table.num_rows:,}", table_id)
 
 
 def main() -> None:
     """Orchestrate the full dump-load pipeline for one entity.
 
-    Flow: fetch latest dump date → skip check → download → extract
-    and upload to GCS → load into BigQuery → clean up temp file.
+    Flow: fetch latest dump date → download and upload to GCS
+    (skipped if blobs already exist) → load into BigQuery.
 
-    Exits cleanly (no error) if blobs already exist for the entity
-    and dump date — to rerun, delete the GCS files first.
+    The GCS upload is skipped when blobs already exist for the
+    entity and dump date.  The BigQuery load always runs, making
+    it safe to rerun after a failed BQ load without re-downloading.
 
     The temp file is always removed, even if extraction fails.
 
@@ -351,24 +364,26 @@ def main() -> None:
     dump_date = get_latest_dump_date()
     dump_url = f"{DUMP_BASE_URL}/{dump_date}/{ENTITY}.tar.xz"
 
-    blob_exist = check_blobs_exist(dump_date)
+    rows_uploaded = None
 
-    if blob_exist:
-        logger.info("Dump already available at %s, skipping", GCS_LANDING_BUCKET)
-        return
+    if check_blobs_exist(dump_date):
+        logger.info(
+            "GCS blobs already exist at gs://%s/mb-dump/%s/%s/, skipping upload",
+            GCS_LANDING_BUCKET, ENTITY, dump_date,
+        )
+    else:
+        dump_path = download_dump(dump_url)
 
-    dump_path = download_dump(dump_url)
-
-    try:
-        rows_uploaded = extract_and_upload(dump_path, dump_date)
-    finally:
-        os.unlink(dump_path)
-        logger.info("Cleaned up temp file %s", dump_path)
+        try:
+            rows_uploaded = extract_and_upload(dump_path, dump_date)
+        finally:
+            os.unlink(dump_path)
+            logger.info("Cleaned up temp file %s", dump_path)
 
     load_to_bigquery(dump_date, rows_uploaded)
 
     elapsed = time.monotonic() - t0
-    logger.info("=== Done: %s lines in %.0fs ===", f"{rows_uploaded:,}", elapsed)
+    logger.info("=== Done in %.0fs ===", elapsed)
 
 
 if __name__ == "__main__":

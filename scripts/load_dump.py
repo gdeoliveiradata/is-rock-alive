@@ -248,7 +248,6 @@ def extract_and_upload(dump_path: str, dump_date: str) -> int:
     return total_lines
 
 
-
 def get_table_id() -> str:
     """Build a fully-qualified BigQuery table ID for the current entity.
 
@@ -262,8 +261,8 @@ def get_table_id() -> str:
     """
     table_name = ENTITY.replace("-", "_")
     if BQ_PROJECT:
-        return f"{BQ_PROJECT}.{BQ_RAW_DATASET}.{table_name}"
-    return f"{BQ_RAW_DATASET}.{table_name}"
+        return f"{BQ_PROJECT}.{BQ_RAW_DATASET}.{table_name}_raw"
+    return f"{BQ_RAW_DATASET}.{table_name}_raw"
 
 
 def load_to_bigquery(dump_date: str, rows_uploaded: int | None = None) -> None:

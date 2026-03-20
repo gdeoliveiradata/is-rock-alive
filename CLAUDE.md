@@ -50,17 +50,17 @@ Two buckets (managed by Terraform):
 Path layout within the landing bucket:
 ```
 gs://is-rock-alive-landing/
-  bulk/{entity}/{entity}_000.jsonl        # One-time dump load (e.g., bulk/event/event_000.jsonl)
-  incremental/{entity}/{date}/{files}     # Daily API loads via dlt
-  dlt-staging/                            # dlt temp files for BigQuery loads
+  mb-dump/{entity}/{dump_date}/{entity}_000.jsonl   # One-time dump load (e.g., mb-dump/event/20260318-001001/event_000.jsonl)
+  incremental/{entity}/{date}/{files}               # Daily API loads via dlt
+  dlt-staging/                                      # dlt temp files for BigQuery loads
 ```
 
 **Why no separate staging bucket?** Originally provisioned but never used by any pipeline. Removed in the 2026-03-16 architecture review. dlt uses a `dlt-staging/` prefix within the landing bucket instead of a separate bucket.
 
 ## BigQuery Datasets
 
-- `raw` — JSONL loads from GCS, fixed schema per table (`data` JSON + audit columns: `_source_file`, `_loaded_at`, `_batch_id`, `_source_system`, `_row_hash`), ingestion-time partitioned (`_PARTITIONTIME`)
-- `staging` — dbt views: extract fields from `data` JSON column, type-cast, renamed columns, deduplicate
+- `raw` — JSONL loads from GCS, fixed schema per table (`json_data` JSON + audit columns: `_source_file`, `_source_system`, `_batch_id`, `_landing_loaded_at`, `_raw_loaded_at`). Raw JSON is wrapped with audit metadata at ingestion time; `_raw_loaded_at` is populated via post-load UPDATE. `_row_hash` is computed in dbt staging, not at ingestion.
+- `staging` — dbt views: extract fields from `json_data` JSON column, type-cast, renamed columns, deduplicate
 - `trusted` — dbt tables: deduplicated dimensions and facts (star schema)
 - `semantic` — dbt tables: aggregated models for Looker Studio
 
@@ -95,25 +95,29 @@ pytest tests/
 - **Additive IAM bindings**: Use `google_project_iam_member` (additive) in Terraform, not `google_project_iam_binding` or `google_project_iam_policy`. Avoids revoking permissions from the user account or Google-managed SAs.
 - **No JSON key files**: SA key creation is disabled by org policy. Locally, authenticate via ADC (`gcloud auth application-default login`). In CI/CD, GitHub Actions uses Workload Identity Federation.
 - **Cloud Run managed via `gcloud`, not Terraform**: Source-based deployment (`gcloud run jobs deploy --source`) builds and deploys in one step. Terraform can't do this.
-- **Two ingestion approaches**: Bulk load (`load_dump.py`) is a one-time dump load using `google-cloud-storage` + `google-cloud-bigquery`. Daily incremental uses dlt (pagination, rate limiting, watermarks). dbt owns all transformations.
-- **Bulk load skip logic**: Checks if blobs already exist at `gs://landing/bulk/{entity}/`. If files exist, logs a message and exits cleanly (not an error). To rerun, manually delete the GCS files first. No force flag.
+- **Two ingestion approaches**: Bulk load (`load_dump.py`) is a one-time dump load using `google-cloud-storage` + `google-cloud-bigquery` + `orjson`. Daily incremental uses dlt (pagination, rate limiting, watermarks). dbt owns all transformations.
+- **Bulk load skip logic**: Checks if blobs already exist at `gs://landing/mb-dump/{entity}/{dump_date}/`. If files exist, skips the download/upload but still runs the BigQuery load. This makes it safe to rerun after a failed BQ load without re-downloading. To fully rerun, manually delete the GCS files first.
+- **Bulk load JSON wrapping**: Each raw JSONL line is wrapped with audit metadata (`json_data`, `_source_file`, `_source_system`, `_batch_id`, `_landing_loaded_at`) before uploading to GCS. The original JSON object is preserved untouched inside `json_data`.
+- **Bulk load `_raw_loaded_at` via post-load UPDATE**: BigQuery's `default_value_expression` does not apply during `load_table_from_uri` with `WRITE_TRUNCATE` (table must pre-exist for defaults to apply). Instead, a post-load `UPDATE` sets `_raw_loaded_at = CURRENT_TIMESTAMP()` on all rows.
+- **Configurable chunk size**: `CHUNK_SIZE_MB` env var (default 100 MB). Smaller locally to avoid upload timeouts, larger on Cloud Run for fewer files and faster BQ loads.
 - **Bulk load uses `WRITE_TRUNCATE`**: Full table replace in BigQuery for idempotency.
 - **Incremental uses `WRITE_APPEND`**: Raw tables are append-only, dbt staging deduplicates by latest record per MBID.
 - **Ingestion-time partitioning on raw tables**: BigQuery adds `_PARTITIONTIME` automatically at load time. Provides a load timestamp without modifying the source data, and enables partition pruning on queries.
 - **GCS landing bucket is a permanent archive**: Data stays in GCS as an immutable copy. If BigQuery loads fail or transformations have bugs, you can reprocess from the landing bucket.
 - **dlt stages through GCS**: dlt uses `gs://landing/dlt-staging/` as a staging area before loading into BigQuery. This is why a separate staging bucket is not needed.
 - **dbt runs on the Airflow VM**: The e2-small VM (2 vCPUs, 2 GB RAM) handles dbt fine — dbt compiles SQL and sends it to BigQuery, no heavy local processing. This avoids a separate Cloud Run Job for dbt and keeps the architecture simpler.
-- **Schema-on-read raw layer**: Raw BigQuery tables use a fixed, entity-agnostic schema: `data` (JSON), `_source_file` (STRING), `_loaded_at` (TIMESTAMP), `_batch_id` (STRING), `_source_system` (STRING), `_row_hash` (STRING). No schema autodetect — all parsing and typing happens in dbt staging models via `JSON_VALUE`/`JSON_EXTRACT_ARRAY`. This decouples ingestion from schema management: upstream MusicBrainz schema changes don't break the load job, and all transformation logic lives in one place (dbt).
+- **Schema-on-read raw layer**: Raw BigQuery tables use a fixed, entity-agnostic schema: `json_data` (JSON), `_source_file` (STRING), `_source_system` (STRING), `_batch_id` (STRING), `_landing_loaded_at` (TIMESTAMP), `_raw_loaded_at` (TIMESTAMP). No schema autodetect — all parsing and typing happens in dbt staging models via `JSON_VALUE`/`JSON_EXTRACT_ARRAY`. `_row_hash` is computed in dbt staging (not at ingestion) since it serves deduplication, which is a transformation concern. This decouples ingestion from schema management: upstream MusicBrainz schema changes don't break the load job, and all transformation logic lives in one place (dbt).
+- **Table naming**: Raw tables are named `{entity}_raw` (e.g., `event_raw`, `release_group_raw`). Hyphens in entity names are converted to underscores.
 - **JSONL for raw layer**: Matches source format, BigQuery loads JSONL natively for free.
 - **Genre via tags**: MusicBrainz has no genre field — genres come from the tag system. A `genre_mapping` dbt seed maps raw tags to standardized categories.
 - **Region**: `us-central1` for all resources (GCS, BigQuery, Cloud Run, GCE). Same-region = free data transfer.
 
 ## Data Flow
 
-1. **Bulk ingest (one-time)**: MusicBrainz tar.xz dump → `load_dump.py` on Cloud Run → `gs://landing/bulk/{entity}/` → BigQuery `raw` (WRITE_TRUNCATE, fixed schema: `data` JSON + audit cols)
+1. **Bulk ingest (one-time)**: MusicBrainz tar.xz dump → `load_dump.py` on Cloud Run → `gs://landing/mb-dump/{entity}/{dump_date}/` → BigQuery `raw.{entity}_raw` (WRITE_TRUNCATE, fixed schema: `json_data` JSON + audit cols, post-load UPDATE for `_raw_loaded_at`)
 2. **Incremental ingest (daily)**: MusicBrainz API → dlt on Cloud Run → `gs://landing/incremental/{entity}/{date}/` → BigQuery `raw` (WRITE_APPEND, same fixed schema)
 3. **Transform (dbt on Airflow VM)**:
-   - `staging` (views) — extract fields from `data` JSON column, cast, rename, deduplicate (latest per MBID), 1:1 with raw tables
+   - `staging` (views) — extract fields from `json_data` JSON column, cast, rename, deduplicate (latest per MBID), compute `_row_hash`, 1:1 with raw tables
    - `trusted` (tables) — star schema: dims (artists, release_groups, labels, events, genres) + facts + bridges
    - `semantic` (tables) — pre-aggregated for dashboards (rock trends by year/subgenre/label)
 4. **Serve**: BigQuery `semantic` → Looker Studio dashboards

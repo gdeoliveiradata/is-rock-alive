@@ -217,11 +217,14 @@ Download (HTTP → temp file) → Extract (tar.xz from disk) → Chunk (JSONL by
 **Key design decisions:**
 - **One script, per-entity executions** — reads `ENTITY` env var, derives all paths. One Cloud Run Job, executed per entity with `--update-env-vars`.
 - **Download-first** — saves tar.xz to a temp file before extracting. Decouples HTTP download from GCS uploads, preventing connection drops.
-- **Byte-based chunking** — splits JSONL at ~100 MB boundaries (BigQuery load job sweet spot).
-- **Skip if already loaded** — checks if blobs exist at `gs://landing/bulk/{entity}/`. If files exist, logs and exits cleanly. To rerun, manually delete the files first.
-- **`WRITE_TRUNCATE`** — full replace for idempotency. Re-running replaces everything.
-- **Ingestion-time partitioning** — BigQuery adds `_PARTITIONTIME` at load time. Provides load timestamp without modifying source data.
-- **GCS paths** — bulk load writes to `gs://landing/bulk/{entity}/`, separate from incremental at `gs://landing/incremental/{entity}/{date}/`.
+- **Byte-based chunking** — splits JSONL at configurable boundaries (`CHUNK_SIZE_MB` env var, default 100 MB). Byte tracking uses the wrapped line size for accurate chunking.
+- **JSON wrapping** — each raw JSONL line is parsed and nested under `json_data`, with audit metadata (`_source_file`, `_source_system`, `_batch_id`, `_landing_loaded_at`) added before upload. Original JSON is preserved untouched. Uses `orjson` for faster parse/serialize.
+- **Skip logic gates upload only** — checks if blobs exist at `gs://landing/mb-dump/{entity}/{dump_date}/`. If files exist, skips download/upload but still runs the BigQuery load. Safe to rerun after a failed BQ load. To fully rerun, delete the GCS files first.
+- **`WRITE_TRUNCATE`** — full table replace for idempotency. Re-running replaces everything.
+- **Post-load UPDATE for `_raw_loaded_at`** — BigQuery's `default_value_expression` does not apply during `load_table_from_uri` with `WRITE_TRUNCATE`. A post-load `UPDATE` sets `_raw_loaded_at = CURRENT_TIMESTAMP()` on all rows.
+- **`_row_hash` computed in dbt** — hash serves deduplication (a transformation concern), so it's computed in dbt staging via `SHA256(TO_JSON_STRING(json_data))`, not at ingestion.
+- **GCS paths** — bulk load writes to `gs://landing/mb-dump/{entity}/{dump_date}/`, separate from incremental at `gs://landing/incremental/{entity}/{date}/`.
+- **Table naming** — raw tables are named `{entity}_raw` (e.g., `event_raw`, `release_group_raw`). Hyphens converted to underscores.
 - **`logging` module** — structured output for Cloud Run's Cloud Logging.
 
 > **Study**: [MusicBrainz database docs](https://musicbrainz.org/doc/MusicBrainz_Database) | [Schema diagram](https://musicbrainz.org/doc/MusicBrainz_Database/Schema)
@@ -230,11 +233,11 @@ Download (HTTP → temp file) → Extract (tar.xz from disk) → Chunk (JSONL by
 
 Before writing any code, understand what you're ingesting.
 
-- [ ] Browse the dump index at https://data.metabrainz.org/pub/musicbrainz/data/json-dumps/
-- [ ] Note the entities and sizes: `event` (~42 MB), `label` (~161 MB), `release-group` (~1 GB), `artist` (~2 GB)
-- [ ] Download `event.tar.xz` locally and inspect the structure: it's a tar containing `mbdump/event`, a JSONL file (one JSON object per line)
-- [ ] Inspect a few lines — note the nested fields (relations, tags, aliases, area, life-span)
-- [ ] Notice that the dump index has a `LATEST` file with the latest dump date string
+- [x] Browse the dump index at https://data.metabrainz.org/pub/musicbrainz/data/json-dumps/
+- [x] Note the entities and sizes: `event` (~42 MB), `label` (~161 MB), `release-group` (~1 GB), `artist` (~2 GB)
+- [x] Download `event.tar.xz` locally and inspect the structure: it's a tar containing `mbdump/event`, a JSONL file (one JSON object per line)
+- [x] Inspect a few lines — note the nested fields (relations, tags, aliases, area, life-span)
+- [x] Notice that the dump index has a `LATEST` file with the latest dump date string
 
 > **Study**: [Python `tarfile`](https://docs.python.org/3/library/tarfile.html) — `tarfile.open()` with mode `r:xz`, iterating members, `extractfile()`.
 >
@@ -249,22 +252,24 @@ How BigQuery loads JSONL drives your chunking and schema decisions.
 This decouples ingestion from schema management — upstream schema changes in MusicBrainz won't break the load job, and all transformation logic lives in one place (dbt).
 
 **Raw table schema:**
-| Column | Type | Description |
-|--------|------|-------------|
-| `data` | `JSON` | The full JSON object from one JSONL line |
-| `_source_file` | `STRING` | GCS blob path the row came from (traceability back to the exact file) |
-| `_loaded_at` | `TIMESTAMP` | When the row was loaded into BigQuery (enables deduplication and freshness checks) |
-| `_batch_id` | `STRING` | Unique ID per load run (e.g., UUID or Cloud Run execution ID). Lets you identify and roll back an entire bad load |
-| `_source_system` | `STRING` | Which pipeline produced the row (e.g., `bulk_load`, `incremental_api`). Useful when both ingestion paths write to the same table |
-| `_row_hash` | `STRING` | SHA256 hash of the `data` column. Enables cheap change detection without comparing full JSON blobs |
+| Column | Type | Mode | Description |
+|--------|------|------|-------------|
+| `json_data` | `JSON` | REQUIRED | The full JSON object from one JSONL line, wrapped at ingestion time |
+| `_source_file` | `STRING` | REQUIRED | GCS blob path the row came from (traceability back to the exact file) |
+| `_source_system` | `STRING` | REQUIRED | Which pipeline produced the row (e.g., `MusicBrainz JSON Dump`, `incremental_api`) |
+| `_batch_id` | `STRING` | REQUIRED | Identifier per load run (dump date for bulk, execution ID for incremental) |
+| `_landing_loaded_at` | `TIMESTAMP` | REQUIRED | When the row was uploaded to GCS (one value per batch) |
+| `_raw_loaded_at` | `TIMESTAMP` | NULLABLE | When the row was loaded into BigQuery (set via post-load UPDATE) |
 
-- [ ] What's the BigQuery `JSON` data type? How does it differ from storing JSON as `STRING`?
-- [ ] How do you define an explicit schema in `LoadJobConfig` instead of using `autodetect`?
-- [ ] What's `source_format` for JSONL? (`NEWLINE_DELIMITED_JSON`)
-- [ ] What are the load job limits? (max file size, row size, nested depth)
-- [ ] `WRITE_TRUNCATE` vs. `WRITE_APPEND` — which makes the bulk load idempotent?
-- [ ] What's a wildcard URI? (`gs://bucket/entity/*.jsonl` loads all chunks in one job)
-- [ ] How do you query a `JSON` column? (`JSON_VALUE()`, `JSON_EXTRACT()`, `JSON_EXTRACT_ARRAY()`)
+**Note:** `_row_hash` is not in the raw schema — it's computed in dbt staging via `SHA256(TO_JSON_STRING(json_data))` since it serves deduplication, a transformation concern.
+
+- [x] What's the BigQuery `JSON` data type? How does it differ from storing JSON as `STRING`?
+- [x] How do you define an explicit schema in `LoadJobConfig` instead of using `autodetect`?
+- [x] What's `source_format` for JSONL? (`NEWLINE_DELIMITED_JSON`)
+- [x] What are the load job limits? (max file size, row size, nested depth)
+- [x] `WRITE_TRUNCATE` vs. `WRITE_APPEND` — which makes the bulk load idempotent?
+- [x] What's a wildcard URI? (`gs://bucket/entity/*.jsonl` loads all chunks in one job)
+- [x] How do you query a `JSON` column? (`JSON_VALUE()`, `JSON_EXTRACT()`, `JSON_EXTRACT_ARRAY()`)
 
 > **Study**: [Loading JSON into BigQuery](https://cloud.google.com/bigquery/docs/loading-data-cloud-storage-json) | [Schema autodetection](https://cloud.google.com/bigquery/docs/schema-detect) | [Load job limits](https://cloud.google.com/bigquery/quotas#load_jobs)
 >
@@ -279,67 +284,68 @@ This decouples ingestion from schema management — upstream schema changes in M
 Build `scripts/load_dump.py` incrementally, testing each piece before moving on. Start with `ENTITY=event` (smallest, fastest feedback).
 
 **Step A — Configuration and setup**
-- [ ] Read `ENTITY` from `os.environ` (fail fast with `KeyError` if missing)
-- [ ] Define constants: `DUMP_BASE_URL`, `BUCKET_NAME`, `BQ_DATASET`, `CHUNK_BYTES` (100 MB)
-- [ ] GCS path prefix: `bulk/{entity}/` (not the bucket root — keeps bulk separate from incremental)
-- [ ] Make `BUCKET_NAME`, `BQ_DATASET`, and `BQ_PROJECT` configurable via env vars with sensible defaults
-- [ ] Set up `logging` (not `print()`) — `basicConfig` with timestamps, write to `sys.stdout`
-- [ ] Write `get_latest_dump_date()` — `GET` the `LATEST` file, return the date string. Use `raise_for_status()` and `timeout`.
+- [x] Read `ENTITY` from `os.environ` (fail fast with `KeyError` if missing)
+- [x] Define constants: `DUMP_BASE_URL`, `BUCKET_NAME`, `BQ_DATASET`, `CHUNK_SIZE_MB` (configurable, default 100 MB)
+- [x] GCS path prefix: `mb-dump/{entity}/{dump_date}/` (not the bucket root — keeps bulk separate from incremental)
+- [x] Make `BUCKET_NAME`, `BQ_DATASET`, `BQ_PROJECT`, and `CHUNK_SIZE_MB` configurable via env vars with sensible defaults
+- [x] Set up `logging` (not `print()`) — `basicConfig` with timestamps, write to `sys.stdout`
+- [x] Write `get_latest_dump_date()` — `GET` the `LATEST` file, return the date string. Use `raise_for_status()` and `timeout`.
 
 > **Study**: [Python `logging` module](https://docs.python.org/3/howto/logging.html)
 
 **Step B — Download the dump**
-- [ ] Write `download_dump(url)` — download the tar.xz to a temp file, return its path
-- [ ] Use `requests.get(url, stream=True)` + `iter_content()` to download in chunks without loading the whole file into memory
-- [ ] Use `tempfile.NamedTemporaryFile(delete=False)` so the file persists after the `with` block closes
-- [ ] Log download size and elapsed time
-- [ ] Test: run just this function, verify the temp file exists and has the right size
+- [x] Write `download_dump(url)` — download the tar.xz to a temp file, return its path
+- [x] Use `requests.get(url, stream=True)` + `iter_content()` to download in chunks without loading the whole file into memory
+- [x] Use `tempfile.NamedTemporaryFile(delete=False)` so the file persists after the `with` block closes
+- [x] Log download size and elapsed time
+- [x] Test: run just this function, verify the temp file exists and has the right size
 
 > **Study**: [Python `requests` — streaming downloads](https://docs.python-requests.readthedocs.io/en/latest/user/advanced/#streaming-requests) | [Python `tempfile`](https://docs.python.org/3/library/tempfile.html)
 
-**Step C — Extract and upload chunks to GCS**
-- [ ] Write `upload_chunk(bucket, entity, lines, chunk_num)` — join lines with `\n`, upload as a blob
-- [ ] GCS blob path: `bulk/{entity}/{entity}_{chunk_num:03d}.jsonl` (zero-padded)
-- [ ] Write `extract_and_upload(dump_path)` — open the tar, find `mbdump/{ENTITY}`, iterate lines
-- [ ] Track accumulated bytes per chunk (use `len(raw_line)` before decoding). Flush to GCS when `>= CHUNK_BYTES`
-- [ ] Reset the byte counter and line buffer after each flush
-- [ ] Don't forget the leftover chunk after the loop ends
-- [ ] Return total line count for later validation
-- [ ] Clean up the temp file in a `finally` block (use `os.unlink()`)
-- [ ] Test: run with event, verify chunks appear in GCS with expected sizes
+**Step C — Extract, wrap, and upload chunks to GCS**
+- [x] Write `upload_chunk(bucket, chunk_num, dump_date)` — join lines with `\n`, upload as a blob
+- [x] GCS blob path: `mb-dump/{entity}/{dump_date}/{entity}_{chunk_num:03d}.jsonl` (zero-padded)
+- [x] Write `create_json_line(line, load_time, chunk_num, dump_date)` — parse raw JSON, wrap under `json_data` with audit metadata
+- [x] Write `extract_and_upload(dump_path, dump_date)` — open the tar, find `mbdump/{ENTITY}`, iterate lines
+- [x] Track accumulated bytes per chunk using wrapped line size (`len(json_line)`). Flush to GCS when `>= CHUNK_SIZE`
+- [x] Reset the byte counter and line buffer after each flush
+- [x] Don't forget the leftover chunk after the loop ends
+- [x] Return total line count for later validation
+- [x] Clean up the temp file in a `finally` block (use `os.unlink()`)
+- [x] Test: run with event, verify chunks appear in GCS with expected sizes
 
 > **Study**: [GCS Python client](https://cloud.google.com/storage/docs/reference/libraries#client-libraries-install-python) — `Blob.upload_from_string()`
 
 **Step D — Load GCS chunks into BigQuery**
-- [ ] Write `load_to_bigquery(rows_uploaded)` — load all chunks into a BigQuery table
-- [ ] Source URI: `gs://{BUCKET_NAME}/bulk/{ENTITY}/*.jsonl` (wildcard loads all chunks in one job)
-- [ ] Define an explicit schema with three columns: `data` (JSON), `_source_file` (STRING), `_loaded_at` (TIMESTAMP). Do NOT use `autodetect` — the fixed schema is intentional (see 2.2)
-- [ ] Configure `LoadJobConfig`: `source_format=NEWLINE_DELIMITED_JSON`, `write_disposition=WRITE_TRUNCATE`, explicit schema
-- [ ] Think about how to populate the audit columns (`_source_file`, `_loaded_at`, `_batch_id`, `_source_system`, `_row_hash`) — can a JSONL load job populate columns that don't exist in the source data? If not, what alternatives are there? (Hint: consider a two-step approach, or adding audit columns after loading, or restructuring the JSONL before upload)
-- [ ] Enable ingestion-time partitioning — BigQuery adds `_PARTITIONTIME` automatically. Use `TimePartitioning(type_=TimePartitioningType.DAY)` in the job config
-- [ ] Handle entity names with hyphens — BigQuery tables can't have hyphens (e.g. `release-group` → `release_group`)
-- [ ] Call `load_table_from_uri()`, then `.result()` to block until the job completes
-- [ ] After loading, query the table's row count and compare to `rows_uploaded`. Log a warning on mismatch.
-- [ ] Test: run the full pipeline with event, verify the table exists in BigQuery with the right schema and row count
+- [x] Write `load_to_bigquery(dump_date, rows_uploaded)` — load all chunks into a BigQuery table
+- [x] Source URI: `gs://{BUCKET_NAME}/mb-dump/{ENTITY}/{dump_date}/*.jsonl` (wildcard loads all chunks in one job)
+- [x] Define an explicit schema matching the wrapped JSONL structure. Do NOT use `autodetect` — the fixed schema is intentional (see 2.2)
+- [x] Configure `LoadJobConfig`: `source_format=NEWLINE_DELIMITED_JSON`, `write_disposition=WRITE_TRUNCATE`, explicit schema
+- [x] Audit columns populated at wrapping time in `create_json_line()` — restructuring the JSONL before upload was the chosen approach
+- [x] `_raw_loaded_at` populated via post-load `UPDATE` (BigQuery `default_value_expression` does not apply during `load_table_from_uri` with `WRITE_TRUNCATE`)
+- [x] Handle entity names with hyphens — BigQuery tables can't have hyphens (e.g. `release-group` → `release_group`). Tables named `{entity}_raw`.
+- [x] Call `load_table_from_uri()`, then `.result()` to block until the job completes
+- [x] After loading, query the table's row count and compare to `rows_uploaded`. Log a warning on mismatch. Validation skipped when `rows_uploaded` is not available (rerun scenario).
+- [x] Test: run the full pipeline with event, verify the table exists in BigQuery with the right schema and row count
 
 > **Study**: [BigQuery `load_table_from_uri`](https://cloud.google.com/python/docs/reference/bigquery/latest/google.cloud.bigquery.client.Client#google_cloud_bigquery_client_Client_load_table_from_uri)
 >
-> **Design note**: Loading JSONL into a single `data` column requires the source JSONL to be wrapped so each line becomes a JSON object with a `data` key, OR the data is loaded as raw JSON strings and cast. Think through which approach is cleanest for populating the six-column schema (data + five audit columns).
+> **Lesson learned**: `default_value_expression` on `SchemaField` only applies when the table already exists before the load job. With `WRITE_TRUNCATE`, the table is recreated during the load, so defaults are not applied. Use a post-load `UPDATE` instead.
 
 **Step E — Skip check**
-- [ ] Before downloading, check if blobs already exist at `gs://bucket/bulk/{entity}/`
-- [ ] If files exist: log a message (e.g., "Entity already loaded, skipping") and exit cleanly (exit code 0)
-- [ ] To rerun: manually delete the GCS files first, then run the script again
+- [x] Before downloading, check if blobs already exist at `gs://bucket/mb-dump/{entity}/{dump_date}/`
+- [x] If files exist: skip download/upload but still run BigQuery load (safe to rerun after failed BQ load)
+- [x] To fully rerun: manually delete the GCS files first, then run the script again
 
 **Step F — Wire it all together**
-- [ ] Write `main()` — orchestrates: skip check → download → extract/upload → BigQuery load
-- [ ] Add `if __name__ == "__main__"` guard
-- [ ] Log total elapsed time at the end
-- [ ] Add a module docstring documenting usage and env vars
+- [x] Write `main()` — orchestrates: skip check → download/upload (if needed) → BigQuery load (always)
+- [x] Add `if __name__ == "__main__"` guard
+- [x] Log total elapsed time at the end
+- [x] Add a module docstring documenting usage and env vars
 
 ### 2.4 Test with All Entities
 
-- [ ] Run with `ENTITY=event` (~42 MB) — fast feedback, end-to-end validation
+- [x] Run with `ENTITY=event` (~42 MB) — fast feedback, end-to-end validation
 - [ ] Run with `ENTITY=label` (~161 MB) — intermediate size
 - [ ] Run with `ENTITY=release-group` (~1 GB) — tests chunking more thoroughly
 - [ ] Run with `ENTITY=artist` (~2 GB compressed) — stress test. Verify temp file cleanup, chunking, and BigQuery load
@@ -347,7 +353,7 @@ Build `scripts/load_dump.py` incrementally, testing each piece before moving on.
 
 ### 2.5 Package and Deploy on Cloud Run
 
-- [ ] Create a source directory for the Cloud Run Job with: `load_dump.py`, `requirements.txt` (`requests`, `google-cloud-storage`, `google-cloud-bigquery`), `Procfile`
+- [ ] Create a source directory for the Cloud Run Job with: `load_dump.py`, `requirements.txt` (`requests`, `orjson`, `google-cloud-storage`, `google-cloud-bigquery`), `Procfile`
 - [ ] Choose memory/CPU allocation (artist needs ~4 GiB for the temp file + processing)
 - [ ] Deploy: `gcloud run jobs deploy --source` with `--service-account` (pipeline SA from Phase 1)
 - [ ] Set shared env vars at deploy time (`BUCKET_NAME`, `BQ_DATASET`); override `ENTITY` per execution
@@ -400,9 +406,9 @@ Build `scripts/load_dump.py` incrementally, testing each piece before moving on.
 
 ### 3.2 Staging Models (raw -> staging)
 
-**Key change from the JSON column approach**: Since raw tables store the full JSON object in a `data` column (see 2.2), staging models are responsible for extracting, typing, and naming all fields. Use `JSON_VALUE(data, '$.field')` for scalar values and `JSON_EXTRACT_ARRAY(data, '$.field')` for arrays. This is where all schema interpretation happens.
+**Key change from the JSON column approach**: Since raw tables store the full JSON object in a `json_data` column (see 2.2), staging models are responsible for extracting, typing, and naming all fields. Use `JSON_VALUE(json_data, '$.field')` for scalar values and `JSON_EXTRACT_ARRAY(json_data, '$.field')` for arrays. This is where all schema interpretation happens, including computing `_row_hash` via `SHA256(TO_JSON_STRING(json_data))`.
 
-- [ ] `stg_artists` — extract fields from `data` JSON column (`JSON_VALUE` for scalars, `JSON_EXTRACT_ARRAY` for tags/aliases), cast types, rename columns, deduplicate by latest record per MBID
+- [ ] `stg_artists` — extract fields from `json_data` JSON column (`JSON_VALUE` for scalars, `JSON_EXTRACT_ARRAY` for tags/aliases), cast types, rename columns, deduplicate by latest record per MBID, compute `_row_hash`
 - [ ] `stg_release_groups` — extract from JSON, normalize release types, extract year from date
 - [ ] `stg_labels` — extract from JSON, clean label data
 - [ ] `stg_events` — extract from JSON, parse event dates and types
@@ -527,7 +533,7 @@ Build `scripts/load_dump.py` incrementally, testing each piece before moving on.
 
 ### 4.3 Load Incremental Data to BigQuery
 - [ ] Append new records to `raw.<entity>` tables (WRITE_APPEND)
-- [ ] Use the same raw table schema as bulk load: `data` (JSON) + audit columns (`_source_file`, `_loaded_at`, `_batch_id`, `_source_system`, `_row_hash`). This keeps both ingestion paths writing to the same tables with the same structure.
+- [ ] Use the same raw table schema as bulk load: `json_data` (JSON) + audit columns (`_source_file`, `_source_system`, `_batch_id`, `_landing_loaded_at`, `_raw_loaded_at`). This keeps both ingestion paths writing to the same tables with the same structure.
 - [ ] Deduplication happens in the dbt staging layer (latest record per MBID, using `_loaded_at` to determine recency)
 
 > **Why append instead of upsert at the raw layer?** Keeping raw as append-only preserves history and keeps ingestion simple. All 3 versions of an artist from 3 daily loads are kept in raw. The dbt staging layer deduplicates by taking the latest record per MBID.

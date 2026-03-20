@@ -105,6 +105,9 @@ Raw data lands in GCS and BigQuery first, untouched. All transformations happen 
 ### Least-Privilege IAM
 Separate Terraform SA (broad permissions for provisioning) and pipeline SA (scoped to what runtime workloads need). All bindings use additive `google_project_iam_member` to avoid accidentally revoking permissions from other principals.
 
+### Clustering Over Partitioning on Raw Tables
+Partitioning by `_raw_loaded_at` was considered but rejected: the bulk load produces one massive partition while daily incremental loads create tiny ones — well under BigQuery's recommended 10 GB per partition threshold. Many small daily partitions would also accumulate toward partition limits over time. Instead, raw tables are clustered by `(_source_system, _raw_loaded_at)`. This lets BigQuery skip bulk-load blocks when dbt staging models process only new incremental data, and further prune by load timestamp within each source system.
+
 ### Cost-Conscious Choices
 - Single region (`us-central1`) for all resources — free intra-region data transfer
 - GCS lifecycle rule transitions landing data to Nearline after 30 days

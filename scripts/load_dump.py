@@ -1,7 +1,7 @@
 """Bulk-load a MusicBrainz JSON dump into GCS and BigQuery.
 
 Downloads a single entity dump (tar.xz) from the MusicBrainz
-mirror, extracts the JSONL content, chunks it into ~250 MB files,
+mirror, extracts the JSONL content, chunks it into ~100 MB files,
 uploads to GCS, and loads into BigQuery with WRITE_TRUNCATE for
 idempotency.
 
@@ -14,6 +14,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import uuid
 from datetime import datetime, timezone
 
 import orjson
@@ -115,6 +116,7 @@ def download_dump(url: str) -> str:
 def create_json_line(
     line: str,
     load_time: str,
+    batch_id: str,
     chunk_num: int,
     dump_date: str,
 ) -> str:
@@ -127,6 +129,7 @@ def create_json_line(
     Args:
         line: A single raw JSONL line from the dump.
         load_time: ISO 8601 UTC timestamp for the load run.
+        batch_id: UUID identifying this load run.
         chunk_num: Current chunk number (used in source file path).
         dump_date: Dump date string used in the source file path.
 
@@ -140,7 +143,7 @@ def create_json_line(
         "json_data": parsed_dict,
         "_source_file": source_file,
         "_source_system": "MusicBrainz JSON Dump",
-        "_batch_id": dump_date,
+        "_batch_id": batch_id,
         "_landing_loaded_at": load_time,
     }).decode()
 
@@ -181,8 +184,8 @@ def extract_and_upload(dump_path: str, dump_date: str) -> int:
     """Extract JSONL from a tar.xz archive and upload to GCS.
 
     Opens the dump archive, reads lines from the matching entity
-    member, buffers them into CHUNK_SIZE batches, and uploads each
-    batch to GCS.  Logs a warning and returns 0 if the expected
+    member, buffers them into CHUNK_SIZE-byte batches, and uploads
+    each batch to GCS.  Logs a warning and returns 0 if the expected
     member is not found.
 
     Args:
@@ -205,6 +208,7 @@ def extract_and_upload(dump_path: str, dump_date: str) -> int:
     chunk_bytes = 0
 
     load_time = datetime.now(timezone.utc).isoformat()
+    batch_id = str(uuid.uuid4())
 
     found = False
 
@@ -220,7 +224,7 @@ def extract_and_upload(dump_path: str, dump_date: str) -> int:
 
             for raw_line in jsonl_file:
                 line = raw_line.decode().strip()
-                json_line = create_json_line(line, load_time, chunk_num, dump_date)
+                json_line = create_json_line(line, load_time, batch_id, chunk_num, dump_date)
                 chunk.append(json_line)
                 chunk_bytes += len(json_line)
 
@@ -296,13 +300,14 @@ def load_to_bigquery(dump_date: str, rows_uploaded: int | None = None) -> None:
             name="_raw_loaded_at",
             field_type="TIMESTAMP",
             mode="NULLABLE",
-        )
+        ),
     ]
 
     job_config = bigquery.LoadJobConfig(
-        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
-        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
         schema=table_schema,
+        source_format="NEWLINE_DELIMITED_JSON",
+        write_disposition="WRITE_TRUNCATE",
+        clustering_fields=["_source_system", "_raw_loaded_at"],
     )
 
     load_job = client.load_table_from_uri(source_uri, table_id, job_config=job_config)

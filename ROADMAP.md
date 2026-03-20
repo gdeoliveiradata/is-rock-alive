@@ -279,6 +279,16 @@ This decouples ingestion from schema management — upstream schema changes in M
 >
 > **Study**: [Querying JSON data in BigQuery](https://cloud.google.com/bigquery/docs/json-data) — extracting fields, arrays, and nested objects from JSON columns.
 
+**Clustering over partitioning on raw tables**: Partitioning by `_raw_loaded_at` was the initial approach, but analysis showed it was a poor fit. The bulk load creates one massive partition (all rows share the same timestamp), while daily incremental loads create tiny partitions — well under BigQuery's recommended 10 GB per partition threshold. Many small daily partitions would also accumulate toward the 4,000-partition limit over time. Per [BigQuery's own guidance](https://cloud.google.com/bigquery/docs/partitioned-tables#when_to_use_partitioning), clustering is preferred when partitions would be small or numerous.
+
+Raw tables are instead clustered by `(_source_system, _raw_loaded_at)`:
+- `_source_system` lets BigQuery skip bulk-load blocks when dbt staging models process only new incremental data (e.g., filtering for `_source_system = 'incremental_api'`)
+- `_raw_loaded_at` enables further block pruning by load timestamp within each source system, optimizing dbt incremental model runs that only need rows since the last execution
+
+> **Study**: [Partitioned tables — when to use partitioning](https://cloud.google.com/bigquery/docs/partitioned-tables#when_to_use_partitioning) — the "Consider clustering" bullet points explain when clustering is the better choice.
+>
+> **Study**: [Introduction to clustered tables](https://cloud.google.com/bigquery/docs/clustered-tables) — how clustering works, column order, and automatic re-clustering.
+
 ### 2.3 Write the Script — Step by Step
 
 Build `scripts/load_dump.py` incrementally, testing each piece before moving on. Start with `ENTITY=event` (smallest, fastest feedback).

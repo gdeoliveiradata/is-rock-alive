@@ -296,11 +296,7 @@ def load_to_bigquery(dump_date: str, rows_uploaded: int | None = None) -> None:
         bigquery.SchemaField(name="_source_system", field_type="STRING", mode="REQUIRED"),
         bigquery.SchemaField(name="_batch_id", field_type="STRING", mode="REQUIRED"),
         bigquery.SchemaField(name="_landing_loaded_at", field_type="TIMESTAMP", mode="REQUIRED"),
-        bigquery.SchemaField(
-            name="_raw_loaded_at",
-            field_type="TIMESTAMP",
-            mode="NULLABLE",
-        ),
+        bigquery.SchemaField(name="_raw_loaded_at", field_type="TIMESTAMP", mode="NULLABLE")
     ]
 
     job_config = bigquery.LoadJobConfig(

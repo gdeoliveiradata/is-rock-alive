@@ -17,7 +17,6 @@ resource "google_project_iam_member" "pipeline_sa_roles" {
     "roles/storage.objectAdmin",
     "roles/compute.instanceAdmin.v1",
     "roles/run.invoker",
-    "roles/run.sourceDeveloper",
     "roles/serviceusage.serviceUsageConsumer",
     "roles/iam.serviceAccountUser",
     "roles/artifactregistry.reader"

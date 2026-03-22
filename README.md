@@ -70,11 +70,13 @@ The project follows a **medallion architecture** (raw → staging → trusted �
 │   ├── main.tf             # Backend + provider config
 │   ├── gcs.tf              # Landing + pipeline buckets
 │   ├── bigquery.tf         # raw, staging, trusted, semantic datasets
-│   ├── iam.tf              # Pipeline SA + 9 role bindings
+│   ├── artifact_registry.tf # Docker repo for Cloud Run images
+│   ├── iam.tf              # Pipeline SA + 8 role bindings
 │   ├── variables.tf        # Input variables
 │   └── outputs.tf          # Bucket names, dataset IDs, SA email
 ├── scripts/
-│   └── load_dump.py        # Bulk ingestion: dump → GCS → BigQuery
+│   ├── load_dump.py        # Bulk ingestion: dump → GCS → BigQuery
+│   └── Dockerfile          # Multi-stage build for Cloud Run deployment
 ├── dbt/                    # Transformation models (staging → trusted → semantic)
 │   ├── models/
 │   ├── seeds/              # Genre mapping CSV
@@ -143,8 +145,28 @@ terraform init
 terraform plan
 terraform apply
 
-# Run bulk ingestion for an entity
+# Run bulk ingestion locally for an entity
 ENTITY=event uv run python scripts/load_dump.py
+
+# Or deploy and run on Cloud Run Jobs
+# One-time: configure Docker auth for Artifact Registry
+gcloud auth configure-docker us-central1-docker.pkg.dev
+
+docker build -t us-central1-docker.pkg.dev/<PROJECT_ID>/cloud-run-images/load-dump scripts/
+docker push us-central1-docker.pkg.dev/<PROJECT_ID>/cloud-run-images/load-dump
+
+gcloud run jobs deploy load-dump \
+  --image us-central1-docker.pkg.dev/<PROJECT_ID>/cloud-run-images/load-dump:latest \
+  --cpu 2 \
+  --memory 8Gi \
+  --task-timeout 90m \
+  --service-account pipeline-sa@<PROJECT_ID>.iam.gserviceaccount.com \
+  --region us-central1
+
+# Execute per entity
+gcloud run jobs execute load-dump \
+  --update-env-vars ENTITY=event,BQ_PROJECT=<PROJECT_ID>,CHUNK_SIZE_MB=250 \
+  --region us-central1
 
 # Run dbt transformations
 cd dbt

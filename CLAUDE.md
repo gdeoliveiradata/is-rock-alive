@@ -13,7 +13,7 @@ MusicBrainz Dump (tar.xz/JSONL) --> [load_dump.py on Cloud Run Job] --> GCS Land
 MusicBrainz API (daily incremental) --> [dlt on Cloud Run Job] --> GCS Landing Bucket --> BigQuery (raw)
 BigQuery (raw) --> dbt (on Airflow VM) --> staging --> trusted --> semantic --> Looker Studio
 Orchestration: Airflow on GCE VM (e2-small, scheduling + dbt execution)
-Ingestion compute: Cloud Run Jobs (source-based deployment via gcloud)
+Ingestion compute: Cloud Run Jobs (Docker image built locally, deployed via gcloud)
 Infrastructure: Terraform
 CI/CD: GitHub Actions
 ```
@@ -32,10 +32,10 @@ CI/CD: GitHub Actions
 ## Project Structure
 
 ```
-terraform/          # GCP infrastructure (GCS, BigQuery, IAM, Airflow VM)
+terraform/          # GCP infrastructure (GCS, BigQuery, IAM, Artifact Registry, Airflow VM)
 dbt/                # dbt project (models, tests, seeds, macros)
 dags/               # Airflow DAGs (local Docker + GCE VM)
-scripts/            # Python ingestion scripts (bulk load, incremental)
+scripts/            # Python ingestion scripts (bulk load, incremental) + Dockerfile
 tests/              # Python unit tests
 .github/workflows/  # CI/CD pipelines
 ```
@@ -80,6 +80,18 @@ dbt build --target dev          # run + test combined
 # Bulk load (local)
 ENTITY=event uv run python scripts/load_dump.py
 
+# Docker build, push, and deploy (Cloud Run)
+docker build -t us-central1-docker.pkg.dev/is-rock-alive/cloud-run-images/load-dump scripts/
+docker push us-central1-docker.pkg.dev/is-rock-alive/cloud-run-images/load-dump
+gcloud run jobs deploy load-dump \
+  --image us-central1-docker.pkg.dev/is-rock-alive/cloud-run-images/load-dump:latest \
+  --cpu 2 --memory 8Gi --task-timeout 90m \
+  --service-account pipeline-sa@is-rock-alive.iam.gserviceaccount.com \
+  --region us-central1
+gcloud run jobs execute load-dump \
+  --update-env-vars ENTITY=event,BQ_PROJECT=is-rock-alive,CHUNK_SIZE_MB=250 \
+  --region us-central1
+
 # Linting
 sqlfluff lint dbt/models/       # SQL linting (BigQuery dialect)
 ruff check scripts/ dags/       # Python linting
@@ -94,12 +106,13 @@ pytest tests/
 - **Terraform SA is the only manual step**: The chicken-and-egg problem — Terraform needs a SA to authenticate, so it must be created via `gcloud` before Terraform runs. The pipeline SA and all its role bindings are managed by Terraform.
 - **Additive IAM bindings**: Use `google_project_iam_member` (additive) in Terraform, not `google_project_iam_binding` or `google_project_iam_policy`. Avoids revoking permissions from the user account or Google-managed SAs.
 - **No JSON key files**: SA key creation is disabled by org policy. Locally, authenticate via ADC (`gcloud auth application-default login`). In CI/CD, GitHub Actions uses Workload Identity Federation.
-- **Cloud Run managed via `gcloud`, not Terraform**: Source-based deployment (`gcloud run jobs deploy --source`) builds and deploys in one step. Terraform can't do this.
+- **Cloud Run managed via `gcloud`, not Terraform**: Images are built locally with `docker build` (multi-stage build for minimal image size), pushed to Artifact Registry (`us-central1-docker.pkg.dev/is-rock-alive/cloud-run-images/`), and deployed with `gcloud run jobs deploy --image`. Source-based deployment (`--source`) was attempted but Cloud Build's internal provisioning failed with NOT_FOUND errors despite the API being enabled. The local build approach also gives more control over the image.
+- **Artifact Registry managed by Terraform**: A Docker-format repository (`cloud-run-images`) in `us-central1` is provisioned by Terraform (`artifact_registry.tf`). The pipeline SA has `roles/artifactregistry.reader` to pull images at runtime; the user's account pushes images after a one-time `gcloud auth configure-docker us-central1-docker.pkg.dev`.
 - **Two ingestion approaches**: Bulk load (`load_dump.py`) is a one-time dump load using `google-cloud-storage` + `google-cloud-bigquery` + `orjson`. Daily incremental uses dlt (pagination, rate limiting, watermarks). dbt owns all transformations.
 - **Bulk load skip logic**: Checks if blobs already exist at `gs://landing/mb-dump/{entity}/{dump_date}/`. If files exist, skips the download/upload but still runs the BigQuery load. This makes it safe to rerun after a failed BQ load without re-downloading. To fully rerun, manually delete the GCS files first.
 - **Bulk load JSON wrapping**: Each raw JSONL line is wrapped with audit metadata (`json_data`, `_source_file`, `_source_system`, `_batch_id`, `_landing_loaded_at`) before uploading to GCS. The original JSON object is preserved untouched inside `json_data`.
 - **Bulk load `_raw_loaded_at` via post-load UPDATE**: BigQuery's `default_value_expression` does not apply during `load_table_from_uri` with `WRITE_TRUNCATE` (table must pre-exist for defaults to apply). Instead, a post-load `UPDATE` sets `_raw_loaded_at = CURRENT_TIMESTAMP()` on all rows.
-- **Configurable chunk size**: `CHUNK_SIZE_MB` env var (default 100 MB). Smaller locally to avoid upload timeouts, larger on Cloud Run for fewer files and faster BQ loads.
+- **Configurable chunk size**: `CHUNK_SIZE_MB` env var (default 100 MB). Set to 250 MB on Cloud Run for fewer files and faster BQ loads; smaller locally to avoid upload timeouts.
 - **Bulk load uses `WRITE_TRUNCATE`**: Full table replace in BigQuery for idempotency.
 - **Incremental uses `WRITE_APPEND`**: Raw tables are append-only, dbt staging deduplicates by latest record per MBID.
 - **Clustering over partitioning on raw tables**: Partitioning by `_raw_loaded_at` was considered but rejected — the bulk load creates one massive partition while daily incremental loads create tiny ones (well under the 10 GB threshold where BigQuery recommends clustering instead). A large number of small daily partitions would also accumulate toward partition limits over time. Instead, raw tables are clustered by `(_source_system, _raw_loaded_at)`: `_source_system` lets BigQuery skip bulk-load rows when processing only incremental data, and `_raw_loaded_at` enables further pruning by load timestamp within each source system. This optimizes the raw → staging read path for dbt incremental models.

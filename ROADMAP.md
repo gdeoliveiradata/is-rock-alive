@@ -2,7 +2,7 @@
 
 End-to-end data engineering project on GCP: ingest MusicBrainz data (initial bulk load from JSONL dumps + daily incremental via API), build a lakehouse on GCS + BigQuery, transform with dbt, orchestrate with Airflow, visualize with Looker Studio. Focus: tracking rock artists, albums, labels, events, and genres over the years.
 
-**Design principle — reproducibility**: The entire project should be reproducible by anyone who clones the repo. Phase 0 is a minimal manual bootstrap (GCP account + Terraform SA). From Phase 1 onward, `terraform apply` provisions all infrastructure, service accounts, and IAM bindings. Cloud Run Jobs are the exception — they're managed via `gcloud` because source-based deployment builds and deploys in one step, which Terraform can't do.
+**Design principle — reproducibility**: The entire project should be reproducible by anyone who clones the repo. Phase 0 is a minimal manual bootstrap (GCP account + Terraform SA). From Phase 1 onward, `terraform apply` provisions all infrastructure, service accounts, IAM bindings, and Artifact Registry. Cloud Run Jobs are the exception — they're managed via `gcloud` (images built locally with Docker, pushed to Artifact Registry, deployed with `gcloud run jobs deploy --image`).
 
 ---
 
@@ -13,11 +13,11 @@ End-to-end data engineering project on GCP: ingest MusicBrainz data (initial bul
 > **Study**: [GCP Resource Hierarchy](https://cloud.google.com/resource-manager/docs/cloud-platform-resource-hierarchy) — understand how organizations, folders, and projects relate. For a personal project you only need a project, but knowing the hierarchy helps you understand IAM inheritance.
 
 ### 0.1 Create GCP Account & Project
-- [ ] Create a Google account (or use existing)
-- [ ] Sign up for GCP at https://cloud.google.com and activate the $300 free trial
-- [ ] Create a new GCP project (e.g., `musicbrainz-lakehouse`)
-- [ ] Link the project to a billing account
-- [ ] Set budget alerts at $25 and $50
+- [x] Create a Google account (or use existing)
+- [x] Sign up for GCP at https://cloud.google.com and activate the $300 free trial
+- [x] Create a new GCP project (e.g., `musicbrainz-lakehouse`)
+- [x] Link the project to a billing account
+- [x] Set budget alerts at $25 and $50
 
 > **Why budget alerts?** Cloud costs can spike unexpectedly — a runaway query or forgotten VM can burn through credits fast. Alerts are your safety net.
 >
@@ -26,19 +26,19 @@ End-to-end data engineering project on GCP: ingest MusicBrainz data (initial bul
 > **Study**: [Creating and managing budgets](https://cloud.google.com/billing/docs/how-to/budgets)
 
 ### 0.2 Install Local Tooling
-- [ ] Install the [Google Cloud SDK (gcloud CLI)](https://cloud.google.com/sdk/docs/install)
-- [ ] Run `gcloud init` and authenticate with your account
-- [ ] Set default project: `gcloud config set project <PROJECT_ID>`
-- [ ] Install Terraform (v1.5+): https://developer.hashicorp.com/terraform/install
-- [ ] Install dbt-core + dbt-bigquery: `pip install dbt-core dbt-bigquery`
-- [ ] Install Python 3.10+
-- [ ] Create a GitHub repository for this project
+- [x] Install the [Google Cloud SDK (gcloud CLI)](https://cloud.google.com/sdk/docs/install)
+- [x] Run `gcloud init` and authenticate with your account
+- [x] Set default project: `gcloud config set project <PROJECT_ID>`
+- [x] Install Terraform (v1.5+): https://developer.hashicorp.com/terraform/install
+- [x] Install dbt-core + dbt-bigquery: `pip install dbt-core dbt-bigquery`
+- [x] Install Python 3.10+
+- [x] Create a GitHub repository for this project
 
 ### 0.3 Enable Required GCP APIs
 
 **Why enable APIs?** GCP follows a "disabled by default" model. Each service has an API that must be explicitly turned on before Terraform or any other tool can manage resources for it.
 
-- [ ] Enable APIs via gcloud:
+- [x] Enable APIs via gcloud:
   ```bash
   gcloud services enable \
     bigquery.googleapis.com \
@@ -59,15 +59,15 @@ End-to-end data engineering project on GCP: ingest MusicBrainz data (initial bul
 
 **Why manual?** This is the chicken-and-egg of IaC: Terraform needs a service account to authenticate, so this SA must exist before Terraform runs. Everything else — including the pipeline SA and all IAM bindings — will be managed by Terraform in Phase 1.
 
-- [ ] Create the Terraform SA:
+- [x] Create the Terraform SA:
   ```bash
   gcloud iam service-accounts create terraform-sa \
     --display-name="Terraform Service Account"
   ```
-- [ ] Grant it the permissions it needs to manage the project:
+- [x] Grant it the permissions it needs to manage the project:
   - `roles/editor` — create/manage most GCP resources
   - `roles/iam.securityAdmin` — manage IAM bindings for other service accounts
-- [ ] Set up Application Default Credentials for local development:
+- [x] Set up Application Default Credentials for local development:
   ```bash
   gcloud auth application-default login
   ```
@@ -103,6 +103,7 @@ terraform/
   gcs.tf               # GCS buckets
   bigquery.tf          # BigQuery datasets
   iam.tf               # Pipeline service account and IAM bindings
+  artifact_registry.tf # Docker repo for Cloud Run container images
   airflow_vm.tf        # GCE VM for Airflow (added in Phase 5)
   outputs.tf           # Output values (bucket names, dataset IDs, SA emails)
 ```
@@ -173,8 +174,7 @@ terraform/
   - `roles/storage.objectAdmin` — read/write GCS objects
   - `roles/compute.instanceAdmin.v1` — manage the Airflow GCE VM
   - `roles/run.invoker` — trigger Cloud Run jobs (used by Airflow)
-  - `roles/run.sourceDeveloper` — deploy Cloud Run jobs from source
-  - `roles/serviceusage.serviceUsageConsumer` — required for source-based deployment
+  - `roles/serviceusage.serviceUsageConsumer` — required for API access
   - `roles/iam.serviceAccountUser` — attach SAs to Cloud Run jobs
   - `roles/artifactregistry.reader` — pull built container images from Artifact Registry
 
@@ -356,20 +356,50 @@ Build `scripts/load_dump.py` incrementally, testing each piece before moving on.
 ### 2.4 Test with All Entities
 
 - [x] Run with `ENTITY=event` (~42 MB) — fast feedback, end-to-end validation
-- [ ] Run with `ENTITY=label` (~161 MB) — intermediate size
-- [ ] Run with `ENTITY=release-group` (~1 GB) — tests chunking more thoroughly
-- [ ] Run with `ENTITY=artist` (~2 GB compressed) — stress test. Verify temp file cleanup, chunking, and BigQuery load
-- [ ] Verify row counts in BigQuery against [MusicBrainz statistics](https://musicbrainz.org/statistics)
+- [x] Run with `ENTITY=label` (~161 MB) — intermediate size
+- [x] Run with `ENTITY=release-group` (~1 GB) — tests chunking more thoroughly
+- [x] Run with `ENTITY=artist` (~2 GB compressed) — stress test. Verify temp file cleanup, chunking, and BigQuery load
+- [x] Verify row counts in BigQuery against [MusicBrainz statistics](https://musicbrainz.org/statistics)
 
 ### 2.5 Package and Deploy on Cloud Run
 
-- [ ] Create a source directory for the Cloud Run Job with: `load_dump.py`, `requirements.txt` (`requests`, `orjson`, `google-cloud-storage`, `google-cloud-bigquery`), `Procfile`
-- [ ] Choose memory/CPU allocation (artist needs ~4 GiB for the temp file + processing)
-- [ ] Deploy: `gcloud run jobs deploy --source` with `--service-account` (pipeline SA from Phase 1)
-- [ ] Set shared env vars at deploy time (`BUCKET_NAME`, `BQ_DATASET`); override `ENTITY` per execution
-- [ ] Execute per entity, monitor logs, verify GCS and BigQuery
+> **Note**: Source-based deployment (`--source`) was attempted but Cloud Build's internal provisioning returned NOT_FOUND errors despite the API being enabled. Switched to building images locally with Docker and pushing to Artifact Registry.
 
-> **Study**: [Cloud Run Jobs](https://cloud.google.com/run/docs/create-jobs) | [Source-based deployment](https://cloud.google.com/run/docs/deploying-source-code) | [Executing jobs](https://cloud.google.com/run/docs/execute/jobs)
+- [x] Create a `Dockerfile` in `scripts/` — multi-stage build (builder installs deps into a venv, runtime copies only the venv + script, no pip/build tools in final image)
+- [x] Create `.dockerignore` in `scripts/` to exclude Procfile, .gcloudignore, __pycache__
+- [x] Add `artifact_registry.tf` to Terraform — Docker-format repo `cloud-run-images` in `us-central1`
+- [x] Remove `roles/run.sourceDeveloper` from IAM (no longer needed without `--source`)
+- [x] Run `terraform apply` to create the Artifact Registry repo
+- [x] Authenticate Docker with Artifact Registry: `gcloud auth configure-docker us-central1-docker.pkg.dev`
+- [x] Build and push the image to `us-central1-docker.pkg.dev/is-rock-alive/cloud-run-images/load-dump`
+- [x] Deploy with `gcloud run jobs deploy --image` (2 vCPU / 8 GiB, pipeline SA). Initially tried 1 vCPU / 4 GiB but the `artist` dump (~2 GB compressed) caused OOM kills (signal 9) — tar.xz decompression + JSON wrapping + 250 MB chunk buffer exceeded 4 GiB.
+- [x] Execute all entities (`event`, `label`, `release-group`, `artist`), verify GCS and BigQuery
+
+**Build and push:**
+```bash
+docker build -t us-central1-docker.pkg.dev/is-rock-alive/cloud-run-images/load-dump scripts/
+docker push us-central1-docker.pkg.dev/is-rock-alive/cloud-run-images/load-dump
+```
+
+**Deploy command:**
+```bash
+gcloud run jobs deploy load-dump \
+  --image us-central1-docker.pkg.dev/is-rock-alive/cloud-run-images/load-dump:latest \
+  --cpu 2 \
+  --memory 8Gi \
+  --task-timeout 90m \
+  --service-account pipeline-sa@is-rock-alive.iam.gserviceaccount.com \
+  --region us-central1
+```
+
+**Execute per entity:**
+```bash
+gcloud run jobs execute load-dump \
+  --update-env-vars ENTITY=event,BQ_PROJECT=is-rock-alive,CHUNK_SIZE_MB=250 \
+  --region us-central1
+```
+
+> **Study**: [Cloud Run Jobs](https://cloud.google.com/run/docs/create-jobs) | [Deploying container images](https://cloud.google.com/run/docs/deploying) | [Executing jobs](https://cloud.google.com/run/docs/execute/jobs) | [Artifact Registry Docker quickstart](https://cloud.google.com/artifact-registry/docs/docker/store-docker-container-images)
 >
 > **CPU-to-memory constraints** (Cloud Run hard limits):
 >
@@ -551,7 +581,7 @@ Build `scripts/load_dump.py` incrementally, testing each piece before moving on.
 > **Why the same schema?** Bulk and incremental loads write to the same raw tables. A uniform schema (`data` + audit columns) means dbt staging models don't need to handle two different source structures.
 
 ### 4.4 Deploy to Cloud Run
-- [ ] Same source-based deployment pattern as Phase 2 (script + `requirements.txt` + `Procfile`)
+- [ ] Same local Docker build + Artifact Registry push pattern as Phase 2
 - [ ] Deploy as `musicbrainz-incremental` Cloud Run Job
 - [ ] Test with a manual execution before wiring up to Airflow
 

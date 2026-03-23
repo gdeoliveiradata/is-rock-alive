@@ -23,6 +23,7 @@ venv/
 *.egg-info/
 dist/
 build/
+.ruff_cache
 
 # GCP credentials
 service-account-key*.json
@@ -46,3 +47,6 @@ docker-compose.override.yml
 
 # Data
 data/
+
+# Claude
+.claude

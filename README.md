@@ -4,30 +4,7 @@ An end-to-end data engineering project on GCP that ingests music metadata from [
 
 ## Architecture
 
-```
-┌─────────────────────┐     ┌──────────────────────┐     ┌──────────────────┐
-│  MusicBrainz Dump   │────▶│  load_dump.py        │────▶│  GCS Landing     │
-│  (tar.xz / JSONL)   │     │  (Cloud Run Job)     │     │  Bucket          │
-└─────────────────────┘     └──────────────────────┘     │  (permanent      │
-                                                          │   archive)       │
-┌─────────────────────┐     ┌──────────────────────┐     │                  │
-│  MusicBrainz API    │────▶│  dlt Pipeline        │────▶│                  │
-│  (daily incremental)│     │  (Cloud Run Job)     │     └────────┬─────────┘
-└─────────────────────┘     └──────────────────────┘              │
-                                                                  │ BigQuery Load
-                                                                  ▼
-┌─────────────────────┐     ┌──────────────────────┐     ┌──────────────────┐
-│  Looker Studio      │◀────│  dbt                 │◀────│  BigQuery        │
-│  Dashboards         │     │  (on Airflow VM)     │     │  raw → staging → │
-└─────────────────────┘     └──────────────────────┘     │  trusted →       │
-                                                          │  semantic        │
-                                    ▲                     └──────────────────┘
-                                    │
-                            ┌───────┴──────────┐
-                            │  Airflow          │
-                            │  (GCE e2-small)   │
-                            └──────────────────┘
-```
+![Architecture Diagram](images/Arch%20Diagram.png)
 
 ## Tech Stack
 

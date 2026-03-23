@@ -52,8 +52,9 @@ The project follows a **medallion architecture** (raw → staging → trusted �
 │   ├── variables.tf        # Input variables
 │   └── outputs.tf          # Bucket names, dataset IDs, SA email
 ├── scripts/
-│   ├── load_dump.py        # Bulk ingestion: dump → GCS → BigQuery
-│   └── Dockerfile          # Multi-stage build for Cloud Run deployment
+│   └── load_dump.py        # Bulk ingestion: dump → GCS → BigQuery
+├── docker/
+│   └── load-dump/          # Dockerfile + requirements for load-dump Cloud Run Job
 ├── dbt/                    # Transformation models (staging → trusted → semantic)
 │   ├── models/
 │   ├── seeds/              # Genre mapping CSV
@@ -129,7 +130,7 @@ ENTITY=event uv run python scripts/load_dump.py
 # One-time: configure Docker auth for Artifact Registry
 gcloud auth configure-docker us-central1-docker.pkg.dev
 
-docker build -t us-central1-docker.pkg.dev/<PROJECT_ID>/cloud-run-images/load-dump scripts/
+docker build -f docker/load-dump/Dockerfile -t us-central1-docker.pkg.dev/<PROJECT_ID>/cloud-run-images/load-dump .
 docker push us-central1-docker.pkg.dev/<PROJECT_ID>/cloud-run-images/load-dump
 
 gcloud run jobs deploy load-dump \

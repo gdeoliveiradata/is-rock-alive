@@ -3,7 +3,7 @@ FROM python:3.10-slim AS builder
 
 WORKDIR /build
 
-COPY requirements.txt .
+COPY docker/load-dump/requirements.txt .
 RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
@@ -18,6 +18,6 @@ COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /app
-COPY load_dump.py .
+COPY scripts/load_dump.py .
 
 ENTRYPOINT ["python", "load_dump.py"]

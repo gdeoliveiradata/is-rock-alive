@@ -35,7 +35,8 @@ CI/CD: GitHub Actions
 terraform/          # GCP infrastructure (GCS, BigQuery, IAM, Artifact Registry, Airflow VM)
 dbt/                # dbt project (models, tests, seeds, macros)
 dags/               # Airflow DAGs (local Docker + GCE VM)
-scripts/            # Python ingestion scripts (bulk load, incremental) + Dockerfile
+scripts/            # Python ingestion scripts (bulk load, incremental)
+docker/             # Dockerfiles and build configs per image
 tests/              # Python unit tests
 .github/workflows/  # CI/CD pipelines
 ```
@@ -81,7 +82,7 @@ dbt build --target dev          # run + test combined
 ENTITY=event uv run python scripts/load_dump.py
 
 # Docker build, push, and deploy (Cloud Run)
-docker build -t us-central1-docker.pkg.dev/is-rock-alive/cloud-run-images/load-dump scripts/
+docker build -f docker/load-dump/Dockerfile -t us-central1-docker.pkg.dev/is-rock-alive/cloud-run-images/load-dump .
 docker push us-central1-docker.pkg.dev/is-rock-alive/cloud-run-images/load-dump
 gcloud run jobs deploy load-dump \
   --image us-central1-docker.pkg.dev/is-rock-alive/cloud-run-images/load-dump:latest \

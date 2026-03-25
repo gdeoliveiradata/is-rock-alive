@@ -265,8 +265,8 @@ def get_table_id() -> str:
     """
     table_name = ENTITY.replace("-", "_")
     if BQ_PROJECT:
-        return f"{BQ_PROJECT}.{BQ_RAW_DATASET}.{table_name}_raw"
-    return f"{BQ_RAW_DATASET}.{table_name}_raw"
+        return f"{BQ_PROJECT}.{BQ_RAW_DATASET}.raw_{table_name}"
+    return f"{BQ_RAW_DATASET}.raw_{table_name}"
 
 
 def load_to_bigquery(dump_date: str, rows_uploaded: int | None = None) -> None:

@@ -1,0 +1,12 @@
+version: 2
+
+# Try using these source definitions instead!
+sources:
+  - name: is_rock_alive
+    schema: raw
+    description: MusicBrainz JSON Dumps data.
+    tables:
+      - name: artist_raw
+      - name: event_raw
+      - name: label_raw
+      - name: release_group_raw
